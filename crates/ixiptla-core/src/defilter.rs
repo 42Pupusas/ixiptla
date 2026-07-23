@@ -1,3 +1,4 @@
+use crate::simd::{WrappingByteAdder, WrappingPrefixSum};
 use crate::{FilterType, Ihdr, InvalidFilterType};
 
 /// Reverses PNG's per-scanline byte filtering (spec §9), turning the
@@ -71,17 +72,48 @@ impl Defilter {
 
     /// `Recon(x) = Filt(x) + Recon(a)`, `a` = bpp bytes to the left (0 if
     /// there isn't one).
+    //
+    // `bpp` interleaved lanes, each independently needing a running
+    // ("prefix") sum, are mutually independent but *within* one lane
+    // there's a genuine sequential dependency: `lane[i]` depends on
+    // `lane[i-1]`. When `bpp == 1` there's only a single lane -- the whole
+    // row *is* that one lane -- so `undo_sub` reduces exactly to
+    // `WrappingPrefixSum::scan`, which computes it with SSE2's
+    // shift-and-add ("Hillis-Steele") trick instead of one dependent
+    // scalar add per byte. `bpp == 1` covers grayscale and indexed-color
+    // images (including all their sub-byte-depth variants -- `bpp` is
+    // always the *byte*-rounded-up stride, never fractional, per spec
+    // §9.2), a common real case.
+    //
+    // For `bpp > 1` (RGB/RGBA/grayscale+alpha), the shift amounts a
+    // multi-lane SSE2 scan needs are only expressible as compile-time
+    // immediates on stable Rust (`_mm_slli_si128`'s shift count is a
+    // `const` generic, and arbitrary `bpp`-dependent const arithmetic
+    // needs the unstable `generic_const_exprs` feature), so those stay on
+    // the plain scalar loop rather than reaching for `unsafe` machinery
+    // this crate can't build on stable across every `bpp` it supports.
     fn undo_sub(&self, content: &mut [u8]) {
+        if self.bpp == 1 {
+            WrappingPrefixSum::scan(content);
+            return;
+        }
         for i in self.bpp..content.len() {
             content[i] = content[i].wrapping_add(content[i - self.bpp]);
         }
     }
 
     /// `Recon(x) = Filt(x) + Recon(b)`, `b` = the byte directly above.
+    //
+    // Unlike `Sub`/`Average`/`Paeth`, `Up` has no dependency between bytes
+    // *within* the row at all -- every output byte depends only on
+    // `previous_row`, a value that's already fully known before this call
+    // starts. That makes it embarrassingly parallel across the whole row,
+    // not just across `bpp` interleaved lanes, so it's handed straight to
+    // `WrappingByteAdder`, which does the actual add 16 bytes at a time via
+    // SSE2 on x86_64 (falling back to the same scalar loop this used to be,
+    // on other architectures).
     fn undo_up(&self, content: &mut [u8]) {
-        for (byte, &above) in content.iter_mut().zip(&self.previous_row) {
-            *byte = byte.wrapping_add(above);
-        }
+        WrappingByteAdder::add_wrapping(content, &self.previous_row);
     }
 
     /// `Recon(x) = Filt(x) + floor((Recon(a) + Recon(b)) / 2)`.

@@ -21,6 +21,7 @@ mod palette;
 mod pixel_bits;
 mod rgba;
 mod signature;
+mod simd;
 mod transparency;
 
 pub use adam7::{Adam7, Adam7Pass};

@@ -1,4 +1,4 @@
-use crate::simd::{WrappingByteAdder, WrappingPrefixSum};
+use crate::simd::{WrappingByteAdder, WrappingLaneScan, WrappingPrefixSum};
 use crate::{FilterType, Ihdr, InvalidFilterType};
 
 /// Reverses PNG's per-scanline byte filtering (spec §9), turning the
@@ -76,29 +76,24 @@ impl Defilter {
     // `bpp` interleaved lanes, each independently needing a running
     // ("prefix") sum, are mutually independent but *within* one lane
     // there's a genuine sequential dependency: `lane[i]` depends on
-    // `lane[i-1]`. When `bpp == 1` there's only a single lane -- the whole
-    // row *is* that one lane -- so `undo_sub` reduces exactly to
-    // `WrappingPrefixSum::scan`, which computes it with SSE2's
-    // shift-and-add ("Hillis-Steele") trick instead of one dependent
-    // scalar add per byte. `bpp == 1` covers grayscale and indexed-color
-    // images (including all their sub-byte-depth variants -- `bpp` is
-    // always the *byte*-rounded-up stride, never fractional, per spec
-    // §9.2), a common real case.
-    //
-    // For `bpp > 1` (RGB/RGBA/grayscale+alpha), the shift amounts a
-    // multi-lane SSE2 scan needs are only expressible as compile-time
-    // immediates on stable Rust (`_mm_slli_si128`'s shift count is a
-    // `const` generic, and arbitrary `bpp`-dependent const arithmetic
-    // needs the unstable `generic_const_exprs` feature), so those stay on
-    // the plain scalar loop rather than reaching for `unsafe` machinery
-    // this crate can't build on stable across every `bpp` it supports.
+    // `lane[i-1]`. `bpp == 1` (grayscale/indexed color, including all
+    // their sub-byte-depth variants -- `bpp` is always the *byte*-rounded-
+    // up stride, never fractional, per spec §9.2) is the degenerate case
+    // where there's only one lane and the whole row is it, handled by
+    // `WrappingPrefixSum`. `bpp` in `2..=8` (every other color type PNG
+    // defines: RGB/RGBA/grayscale+alpha at 8 or 16 bits) goes through
+    // `WrappingLaneScan`, which generalizes the same Hillis-Steele
+    // shift-and-add trick to `bpp` deinterleaved lanes at once via a
+    // handful of const-generic-monomorphized SSE2 instantiations. Both
+    // fall back to an equivalent plain scalar loop internally for any
+    // `bpp` (or, on x86_64, any leftover tail bytes) they don't have a
+    // vectorized path for, so this dispatch is purely a performance
+    // choice, never a correctness one.
     fn undo_sub(&self, content: &mut [u8]) {
         if self.bpp == 1 {
             WrappingPrefixSum::scan(content);
-            return;
-        }
-        for i in self.bpp..content.len() {
-            content[i] = content[i].wrapping_add(content[i - self.bpp]);
+        } else {
+            WrappingLaneScan::scan(content, self.bpp);
         }
     }
 

@@ -216,9 +216,181 @@ impl WrappingPrefixSum {
     }
 }
 
+/// SIMD-accelerated wrapping prefix sum over `bpp`-interleaved lanes --
+/// the multi-channel generalization of [`WrappingPrefixSum`] (which only
+/// handles the single-lane `bpp == 1` case).
+///
+/// `Sub`'s reconstruction `Recon(x) = Filt(x) + Recon(x - bpp)` is, for
+/// `bpp > 1`, `bpp` *independent* running sums interleaved byte-for-byte:
+/// lane `k` (all bytes at position `i` with `i % bpp == k`) needs its own
+/// prefix sum, but lane `k`'s sum has no dependency on any other lane.
+/// Grayscale/indexed (`bpp == 1`) is the special case where there's only
+/// one lane and the whole row is it; every other color type/bit-depth
+/// combination PNG defines has `bpp` in `{2, 3, 4, 6, 8}` (2/4-channel
+/// 8/16-bit and 3-channel 8/16-bit truecolor), which is what this handles.
+#[derive(Debug)]
+pub struct WrappingLaneScan;
+
+impl WrappingLaneScan {
+    /// Computes an in-place inclusive wrapping (mod-256) prefix sum
+    /// independently within each of `bpp` interleaved lanes: afterwards,
+    /// for every `i`, `data[i]` holds the wrapping sum of `data_before[j]`
+    /// over every `j <= i` with `j % bpp == i % bpp` (i.e. every earlier
+    /// position sharing `i`'s lane).
+    ///
+    /// `bpp` must be in `2..=8` for the SSE2 fast path to trigger; any
+    /// other value (including the `bpp == 1` case handled by
+    /// [`WrappingPrefixSum`] instead) falls back to the scalar per-lane
+    /// loop, which is correct for every `bpp` -- the SIMD path is a pure
+    /// optimization of the same math, not a different algorithm.
+    pub fn scan(data: &mut [u8], bpp: usize) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            match bpp {
+                2 => return Self::scan_sse2::<2, 3>(data, [2, 4, 8]),
+                3 => return Self::scan_sse2::<3, 3>(data, [3, 6, 12]),
+                4 => return Self::scan_sse2::<4, 2>(data, [4, 8, 0]),
+                6 => return Self::scan_sse2::<6, 2>(data, [6, 12, 0]),
+                8 => return Self::scan_sse2::<8, 1>(data, [8, 0, 0]),
+                _ => {}
+            }
+        }
+        Self::scan_scalar(data, bpp);
+    }
+
+    /// Plain per-lane scalar running sum: used as the fallback for `bpp`
+    /// values the SSE2 path doesn't special-case, and as the entire
+    /// implementation on non-`x86_64` targets.
+    fn scan_scalar(data: &mut [u8], bpp: usize) {
+        for lane in 0..bpp {
+            let mut running = 0u8;
+            let mut i = lane;
+            while i < data.len() {
+                running = running.wrapping_add(data[i]);
+                data[i] = running;
+                i += bpp;
+            }
+        }
+    }
+
+    /// SSE2 per-lane Hillis-Steele scan, generalizing [`WrappingPrefixSum::
+    /// scan_sse2`]'s single-lane version to `BPP` interleaved lanes.
+    ///
+    /// `SHIFTS` is the sequence of byte-shift amounts (as multiples of
+    /// `BPP`, doubling each round: `BPP, 2*BPP, 4*BPP, ...`) needed to
+    /// fully combine every element within a 16-byte register into its
+    /// lane's own prefix sum -- unused trailing rounds beyond `PASSES` are
+    /// padded with `0` and skipped. Shifting the *whole* 128-bit register
+    /// by a multiple of `BPP` bytes is what keeps lane alignment intact
+    /// across the shift (`result[i] = a[i - k*BPP]`, and `(i - k*BPP) %
+    /// BPP == i % BPP`), unlike shifting by an arbitrary amount, which
+    /// would mix bytes from different color channels together.
+    ///
+    /// Processes `chunk_bytes = (16 / BPP) * BPP` bytes per iteration --
+    /// the largest whole number of *complete pixels* that fits in one
+    /// 16-byte register -- rather than a full 16 bytes every time, so
+    /// that consecutive chunks stay phase-aligned at lane 0 even when
+    /// `BPP` doesn't evenly divide 16 (`BPP == 3` or `6`); the register
+    /// still loads (and, transiently, computes over) up to 16 bytes for
+    /// simplicity, but only the pixel-aligned prefix is ever written back,
+    /// so the unwritten remainder is re-read intact (still original,
+    /// unfiltered-only) by the next iteration or the scalar tail.
+    #[cfg(target_arch = "x86_64")]
+    fn scan_sse2<const BPP: usize, const PASSES: usize>(data: &mut [u8], shifts: [i32; 3]) {
+        use std::arch::x86_64::{_mm_loadu_si128, _mm_storeu_si128};
+
+        let pixels_per_chunk = 16 / BPP;
+        let chunk_bytes = pixels_per_chunk * BPP;
+        let len = data.len();
+
+        let mut carry = [0u8; BPP]; // this lane's running total carried out of the previous chunk.
+        let mut offset = 0usize;
+        // Each iteration needs a full 16-byte lookahead to load safely,
+        // even though it only advances (and writes back) `chunk_bytes` --
+        // stop the SIMD loop once that lookahead would run past the end,
+        // and let the scalar tail (which needs no such lookahead) finish
+        // the rest, continuing from this loop's own last carry.
+        while offset + 16 <= len {
+            // SAFETY: `offset + 16 <= len` was just checked, so the
+            // 16-byte unaligned load is in bounds; only the first
+            // `chunk_bytes <= 16` bytes of `scanned` are ever written back
+            // into `data`, and `offset + chunk_bytes <= offset + 16 <=
+            // len`, so that store is in bounds too.
+            let mut x = unsafe { _mm_loadu_si128(data.as_ptr().add(offset).cast()) };
+            // SAFETY: shift amounts used here are compile-time constants
+            // (elements of `shifts`, threaded through as plain `i32`
+            // function arguments) in `0..=15` for every `BPP` this is
+            // instantiated with, which `_mm_slli_si128`'s immediate-shift
+            // intrinsic requires -- checked once per call below rather
+            // than relying on `shifts`' construction alone.
+            for &shift in shifts.iter().take(PASSES) {
+                x = Self::shift_and_add(x, shift);
+            }
+            let mut scanned = [0u8; 16];
+            // SAFETY: `scanned` is a local, fully-owned 16-byte buffer.
+            unsafe { _mm_storeu_si128(scanned.as_mut_ptr().cast(), x) };
+
+            // Fold in the previous chunk's per-lane carry (broadcast to
+            // every pixel's worth of that lane within this chunk) before
+            // writing back -- can't be part of the SIMD reduction above
+            // since it's a *per-lane*, not per-register-wide, addend.
+            for (i, byte) in scanned.iter_mut().enumerate().take(chunk_bytes) {
+                *byte = byte.wrapping_add(carry[i % BPP]);
+            }
+
+            data[offset..offset + chunk_bytes].copy_from_slice(&scanned[..chunk_bytes]);
+
+            // The new carry is this chunk's own last pixel, one byte per
+            // lane, read back from what was just written (already
+            // includes the fold-in above).
+            carry.copy_from_slice(&data[offset + chunk_bytes - BPP..offset + chunk_bytes]);
+
+            offset += chunk_bytes;
+        }
+
+        // Scalar tail: same per-lane running-sum shape as `scan_scalar`,
+        // but seeded from this loop's carry instead of starting at 0, and
+        // walking `data[offset..]` instead of the whole slice.
+        let tail = &mut data[offset..];
+        for (lane, &carry_in) in carry.iter().enumerate().take(BPP) {
+            let mut running = carry_in;
+            let mut i = lane;
+            while i < tail.len() {
+                running = running.wrapping_add(tail[i]);
+                tail[i] = running;
+                i += BPP;
+            }
+        }
+    }
+
+    /// Dispatches to the one `_mm_slli_si128` immediate this call needs --
+    /// `shift` is always one of a small fixed set of compile-time-known
+    /// values (an element of `scan_sse2`'s own `shifts` array literals),
+    /// but arrives here as a plain runtime `i32` (it's read out of an
+    /// array via a loop, not spelled as a literal at the call site), and
+    /// `_mm_slli_si128`'s shift count must be a `const` -- hence the
+    /// match turning "one of a few runtime values" back into "one of a
+    /// few compile-time immediates" the intrinsic can actually take.
+    #[cfg(target_arch = "x86_64")]
+    fn shift_and_add(x: std::arch::x86_64::__m128i, shift: i32) -> std::arch::x86_64::__m128i {
+        use std::arch::x86_64::{_mm_add_epi8, _mm_slli_si128};
+        let shifted = match shift {
+            1 => unsafe { _mm_slli_si128::<1>(x) },
+            2 => unsafe { _mm_slli_si128::<2>(x) },
+            3 => unsafe { _mm_slli_si128::<3>(x) },
+            4 => unsafe { _mm_slli_si128::<4>(x) },
+            6 => unsafe { _mm_slli_si128::<6>(x) },
+            8 => unsafe { _mm_slli_si128::<8>(x) },
+            12 => unsafe { _mm_slli_si128::<12>(x) },
+            _ => return x, // shift == 0: padding entry for unused passes, a no-op.
+        };
+        unsafe { _mm_add_epi8(x, shifted) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{WrappingByteAdder, WrappingPrefixSum};
+    use super::{WrappingByteAdder, WrappingLaneScan, WrappingPrefixSum};
 
     #[test]
     fn matches_scalar_wrapping_add_elementwise() {
@@ -305,5 +477,66 @@ mod tests {
         let mut data: Vec<u8> = vec![];
         WrappingPrefixSum::scan(&mut data);
         assert_eq!(data, Vec::<u8>::new());
+    }
+
+    /// Reference scalar per-lane prefix sum, mirroring `Sub`'s own
+    /// reconstruction formula at general `bpp` -- used to check
+    /// `WrappingLaneScan::scan` independent of its own SIMD/scalar split.
+    fn scalar_lane_scan(data: &[u8], bpp: usize) -> Vec<u8> {
+        let mut out = data.to_vec();
+        for lane in 0..bpp {
+            let mut running = 0u8;
+            let mut i = lane;
+            while i < out.len() {
+                running = running.wrapping_add(out[i]);
+                out[i] = running;
+                i += bpp;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn lane_scan_matches_scalar_reference_for_every_supported_bpp() {
+        // Every bpp PNG's spec actually produces (1 handled separately by
+        // WrappingPrefixSum; 2/3/4/6/8 here), across a spread of lengths
+        // that cross the SSE2 chunk boundary at various phases relative to
+        // bpp (a chunk is (16/bpp)*bpp bytes, not always 16), including
+        // lengths not a whole number of pixels (truncated final pixel --
+        // never produced by a real IDAT stream, but the scan must still
+        // not go out of bounds or panic).
+        for bpp in [2usize, 3, 4, 6, 8] {
+            for len in [0usize, 1, bpp, bpp * 2, 15, 16, 17, 31, 32, 33, 100, 251] {
+                let data: Vec<u8> = (0..len as u32).map(|n| ((n * 41 + 13) % 256) as u8).collect();
+                let expected = scalar_lane_scan(&data, bpp);
+                let mut actual = data.clone();
+                WrappingLaneScan::scan(&mut actual, bpp);
+                assert_eq!(actual, expected, "bpp={bpp} len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn lane_scan_wraps_on_overflow_per_lane() {
+        // bpp=2, two interleaved lanes: [200, 5, 100, 250, 50, 10]
+        // lane 0 (idx 0,2,4): 200, 300%256=44, 44+50=94
+        // lane 1 (idx 1,3,5): 5, 5+250=255, 255+10=265%256=9
+        let mut data = vec![200u8, 5, 100, 250, 50, 10];
+        WrappingLaneScan::scan(&mut data, 2);
+        assert_eq!(data, vec![200u8, 5, 44, 255, 94, 9]);
+    }
+
+    #[test]
+    fn lane_scan_falls_back_correctly_for_unsupported_bpp() {
+        // bpp values PNG never actually produces (e.g. 5, 7) still need to
+        // work correctly via the scalar fallback -- WrappingLaneScan::scan
+        // doesn't assume bpp is one of the SSE2-special-cased values.
+        for bpp in [5usize, 7, 9] {
+            let data: Vec<u8> = (0..40u32).map(|n| (n * 3) as u8).collect();
+            let expected = scalar_lane_scan(&data, bpp);
+            let mut actual = data.clone();
+            WrappingLaneScan::scan(&mut actual, bpp);
+            assert_eq!(actual, expected, "bpp={bpp}");
+        }
     }
 }

@@ -9,6 +9,7 @@
 //! `ixchel::zlib` over the concatenated `IDAT` stream. It does not depend on
 //! any external PNG/compression crate.
 
+mod adam7;
 mod chunk;
 mod color_type;
 mod crc32;
@@ -16,8 +17,10 @@ mod decoder;
 mod defilter;
 mod filter_type;
 mod ihdr;
+mod pixel_bits;
 mod signature;
 
+pub use adam7::{Adam7, Adam7Pass};
 pub use chunk::{Chunk, ChunkError, ChunkReader};
 pub use color_type::{ColorType, InvalidColorType};
 pub use crc32::Crc32;
@@ -25,4 +28,5 @@ pub use decoder::{DecodeError, Png};
 pub use defilter::Defilter;
 pub use filter_type::{FilterType, InvalidFilterType};
 pub use ihdr::{Ihdr, IhdrError, InterlaceMethod};
+pub use pixel_bits::PixelBits;
 pub use signature::{Signature, SignatureError};

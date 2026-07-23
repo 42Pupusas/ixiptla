@@ -1,6 +1,6 @@
 use crate::{
-    ChunkError, ChunkReader, Defilter, Ihdr, IhdrError, InterlaceMethod, InvalidFilterType,
-    Signature, SignatureError,
+    Adam7, ChunkError, ChunkReader, Defilter, Ihdr, IhdrError, InterlaceMethod,
+    InvalidFilterType, Signature, SignatureError,
 };
 
 /// A decoded PNG: its header metadata plus the raw, defiltered pixel bytes
@@ -39,13 +39,6 @@ impl Png {
         }
         let ihdr = Ihdr::parse(first.data())?;
 
-        // Interlacing (Adam7) needs its own per-pass reassembly step this
-        // crate doesn't implement yet -- reject explicitly rather than
-        // silently defiltering interlaced data as if it were sequential.
-        if ihdr.interlace != InterlaceMethod::None {
-            return Err(DecodeError::UnsupportedInterlace);
-        }
-
         // Spec §5.6: "the IDAT chunks... are treated as a single stream" --
         // concatenate their data in file order before handing it to zlib.
         let mut idat = Vec::new();
@@ -62,6 +55,17 @@ impl Png {
 
         let inflated = ixchel::zlib::decompress(&idat, max_decompressed)?;
 
+        let pixels = match ihdr.interlace {
+            InterlaceMethod::None => Self::defilter_sequential(&ihdr, inflated)?,
+            InterlaceMethod::Adam7 => Self::defilter_adam7(&ihdr, &inflated)?,
+        };
+
+        Ok(Self { ihdr, pixels })
+    }
+
+    /// Defilter a non-interlaced `IDAT` stream: one flat sequence of
+    /// `1 + stride`-byte scanlines, top to bottom.
+    fn defilter_sequential(ihdr: &Ihdr, mut inflated: Vec<u8>) -> Result<Vec<u8>, DecodeError> {
         let row_len = 1 + ihdr.stride();
         if inflated.len() % row_len != 0 {
             return Err(DecodeError::TruncatedImageData);
@@ -74,15 +78,69 @@ impl Png {
             });
         }
 
-        let mut defilter = Defilter::new(&ihdr);
+        let mut defilter = Defilter::new(ihdr);
         let mut pixels = Vec::with_capacity(ihdr.stride() * row_count);
-        let mut inflated = inflated;
         for row in inflated.chunks_mut(row_len) {
             defilter.defilter_row(row)?;
             pixels.extend_from_slice(&row[1..]);
         }
+        Ok(pixels)
+    }
 
-        Ok(Self { ihdr, pixels })
+    /// Defilter and reassemble an `Adam7`-interlaced `IDAT` stream.
+    ///
+    /// The 7 passes are concatenated back to back in the same inflated
+    /// stream, each pass being its own tiny sequential image (spec §8.2):
+    /// its own row count/stride derived from [`Adam7Pass`]'s geometry, and
+    /// crucially its own independent filter-predictor state (a pass's
+    /// first row has no "previous row" from the pass before it — passes
+    /// are unrelated sequences, not one continuous scanline stream).
+    fn defilter_adam7(ihdr: &Ihdr, inflated: &[u8]) -> Result<Vec<u8>, DecodeError> {
+        let adam7 = Adam7::new(ihdr);
+        let passes = adam7.passes();
+        let mut full_image = vec![0u8; ihdr.stride() * ihdr.height as usize];
+        let mut offset = 0usize;
+
+        for pass in &passes {
+            if pass.is_empty() {
+                continue;
+            }
+            // A pass is itself a valid tiny image at its own bit depth/
+            // color type, so its per-row stride follows the same
+            // bits-per-pixel math as the full image, just at the pass's
+            // narrower width.
+            let pass_stride = (ihdr.bits_per_pixel() as usize * pass.width as usize).div_ceil(8);
+            let row_len = 1 + pass_stride;
+            let pass_bytes = row_len * pass.height as usize;
+
+            let pass_end = offset
+                .checked_add(pass_bytes)
+                .filter(|&end| end <= inflated.len())
+                .ok_or(DecodeError::TruncatedImageData)?;
+            let mut pass_data = inflated[offset..pass_end].to_vec();
+            offset = pass_end;
+
+            let mut defilter = Defilter::new(&Ihdr {
+                width: pass.width,
+                height: pass.height,
+                bit_depth: ihdr.bit_depth,
+                color_type: ihdr.color_type,
+                interlace: InterlaceMethod::None,
+            });
+            let mut pass_pixels = Vec::with_capacity(pass_stride * pass.height as usize);
+            for row in pass_data.chunks_mut(row_len) {
+                defilter.defilter_row(row)?;
+                pass_pixels.extend_from_slice(&row[1..]);
+            }
+
+            adam7.scatter_pass(pass, &pass_pixels, &mut full_image);
+        }
+
+        if offset != inflated.len() {
+            return Err(DecodeError::TruncatedImageData);
+        }
+
+        Ok(full_image)
     }
 }
 
@@ -95,8 +153,6 @@ pub enum DecodeError {
     /// The chunk stream's first chunk wasn't `IHDR` (spec §5.6 requires it
     /// to be first), or there was no `IHDR` chunk at all.
     MissingIhdr,
-    /// This crate doesn't yet reassemble `Adam7`-interlaced scanlines.
-    UnsupportedInterlace,
     /// No `IDAT` chunks were present before `IEND`/end of stream.
     NoImageData,
     /// The inflated `IDAT` stream's length isn't a whole number of
@@ -146,7 +202,6 @@ impl core::fmt::Display for DecodeError {
             Self::Chunk(e) => write!(f, "{e}"),
             Self::Ihdr(e) => write!(f, "{e}"),
             Self::MissingIhdr => write!(f, "PNG chunk stream does not start with IHDR"),
-            Self::UnsupportedInterlace => write!(f, "Adam7 interlacing is not yet supported"),
             Self::NoImageData => write!(f, "no IDAT chunks found"),
             Self::TruncatedImageData => {
                 write!(f, "inflated IDAT data is not a whole number of scanlines")
@@ -172,12 +227,12 @@ mod tests {
     /// one IDAT (zlib-wrapped, uncompressed-filter-byte-0 scanlines) +
     /// IEND, so the whole pipeline can be exercised without needing a real
     /// PNG fixture file on disk.
-    fn encode_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    fn encode_chunk(kind: [u8; 4], data: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        out.extend_from_slice(kind);
+        out.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+        out.extend_from_slice(&kind);
         out.extend_from_slice(data);
-        let crc = Crc32::new().update(kind).update(data).finalize();
+        let crc = Crc32::new().update(&kind).update(data).finalize();
         out.extend_from_slice(&crc.to_be_bytes());
         out
     }
@@ -193,12 +248,12 @@ mod tests {
         ihdr_data.push(0); // compression
         ihdr_data.push(0); // filter
         ihdr_data.push(0); // interlace: none
-        file.extend(encode_chunk(b"IHDR", &ihdr_data));
+        file.extend(encode_chunk(*b"IHDR", &ihdr_data));
 
         let zlib_data = ixchel::zlib::compress(raw_scanlines);
-        file.extend(encode_chunk(b"IDAT", &zlib_data));
+        file.extend(encode_chunk(*b"IDAT", &zlib_data));
 
-        file.extend(encode_chunk(b"IEND", b""));
+        file.extend(encode_chunk(*b"IEND", b""));
         file
     }
 
@@ -235,7 +290,7 @@ mod tests {
     #[test]
     fn rejects_stream_not_starting_with_ihdr() {
         let mut file = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-        file.extend(encode_chunk(b"IEND", b""));
+        file.extend(encode_chunk(*b"IEND", b""));
         let err = Png::decode(&file, 1 << 20).unwrap_err();
         assert!(matches!(err, DecodeError::MissingIhdr));
     }
@@ -247,8 +302,8 @@ mod tests {
         ihdr_data.extend_from_slice(&1u32.to_be_bytes());
         ihdr_data.extend_from_slice(&1u32.to_be_bytes());
         ihdr_data.extend_from_slice(&[8, 0, 0, 0, 0]);
-        file.extend(encode_chunk(b"IHDR", &ihdr_data));
-        file.extend(encode_chunk(b"IEND", b""));
+        file.extend(encode_chunk(*b"IHDR", &ihdr_data));
+        file.extend(encode_chunk(*b"IEND", b""));
 
         let err = Png::decode(&file, 1 << 20).unwrap_err();
         assert!(matches!(err, DecodeError::NoImageData));
@@ -263,10 +318,10 @@ mod tests {
         ihdr_data.extend_from_slice(&2u32.to_be_bytes());
         ihdr_data.extend_from_slice(&3u32.to_be_bytes()); // claims height 3
         ihdr_data.extend_from_slice(&[8, 0, 0, 0, 0]);
-        file.extend(encode_chunk(b"IHDR", &ihdr_data));
+        file.extend(encode_chunk(*b"IHDR", &ihdr_data));
         let zlib_data = ixchel::zlib::compress(&raw); // only 2 actual rows
-        file.extend(encode_chunk(b"IDAT", &zlib_data));
-        file.extend(encode_chunk(b"IEND", b""));
+        file.extend(encode_chunk(*b"IDAT", &zlib_data));
+        file.extend(encode_chunk(*b"IEND", b""));
 
         let err = Png::decode(&file, 1 << 20).unwrap_err();
         assert!(matches!(err, DecodeError::RowCountMismatch { expected: 3, actual: 2 }));
@@ -283,31 +338,77 @@ mod tests {
         ihdr_data.extend_from_slice(&2u32.to_be_bytes());
         ihdr_data.extend_from_slice(&2u32.to_be_bytes());
         ihdr_data.extend_from_slice(&[8, 0, 0, 0, 0]);
-        file.extend(encode_chunk(b"IHDR", &ihdr_data));
-        file.extend(encode_chunk(b"IDAT", &zlib_data[..mid]));
-        file.extend(encode_chunk(b"IDAT", &zlib_data[mid..]));
-        file.extend(encode_chunk(b"IEND", b""));
+        file.extend(encode_chunk(*b"IHDR", &ihdr_data));
+        file.extend(encode_chunk(*b"IDAT", &zlib_data[..mid]));
+        file.extend(encode_chunk(*b"IDAT", &zlib_data[mid..]));
+        file.extend(encode_chunk(*b"IEND", b""));
 
         let png = Png::decode(&file, 1 << 20).unwrap();
         assert_eq!(png.pixels, vec![10, 20, 30, 40]);
     }
 
-    #[test]
-    fn rejects_adam7_interlace() {
+    /// Build an `Adam7`-interlaced PNG file: `raw_scanlines` is provided
+    /// per-pass (already in the right order/shape for each of the 7
+    /// passes), each pass's rows filter-byte-0 (identity) prefixed.
+    fn build_adam7_png(
+        width: u32,
+        height: u32,
+        color_type: u8,
+        bit_depth: u8,
+        pass_raw_scanlines: &[Vec<u8>],
+    ) -> Vec<u8> {
         let mut file = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+
         let mut ihdr_data = Vec::new();
-        ihdr_data.extend_from_slice(&1u32.to_be_bytes());
-        ihdr_data.extend_from_slice(&1u32.to_be_bytes());
-        ihdr_data.push(8);
-        ihdr_data.push(0);
+        ihdr_data.extend_from_slice(&width.to_be_bytes());
+        ihdr_data.extend_from_slice(&height.to_be_bytes());
+        ihdr_data.push(bit_depth);
+        ihdr_data.push(color_type);
         ihdr_data.push(0);
         ihdr_data.push(0);
         ihdr_data.push(1); // Adam7
-        file.extend(encode_chunk(b"IHDR", &ihdr_data));
-        file.extend(encode_chunk(b"IDAT", b"anything"));
-        file.extend(encode_chunk(b"IEND", b""));
+        file.extend(encode_chunk(*b"IHDR", &ihdr_data));
 
+        let mut idat_source = Vec::new();
+        for pass in pass_raw_scanlines {
+            idat_source.extend_from_slice(pass);
+        }
+        let zlib_data = ixchel::zlib::compress(&idat_source);
+        file.extend(encode_chunk(*b"IDAT", &zlib_data));
+        file.extend(encode_chunk(*b"IEND", b""));
+        file
+    }
+
+    #[test]
+    fn decodes_adam7_interlaced_2x2_grayscale() {
+        // 2x2, 8-bit grayscale: for a 2x2 image, only passes 1 (pixel
+        // (0,0)), 6 (pixel (1,0)), and 7 (row y=1, both columns) are
+        // non-empty -- passes 2..5 all contribute zero pixels (spec
+        // §8.2, small-image case; verified by
+        // `tiny_image_has_empty_late_passes`-style geometry: pass 6's
+        // x_start=1 still falls inside a width-2 image).
+        // Target pixel grid: (0,0)=42 (1,0)=7 (0,1)=99 (1,1)=100.
+        let pass1 = vec![0u8, 42]; // 1x1: filter byte + 1 content byte
+        let pass6 = vec![0u8, 7]; // 1x1: filter byte + 1 content byte
+        let pass7 = vec![0u8, 99, 100]; // 2x1: filter byte + 2 content bytes
+        let file = build_adam7_png(2, 2, 0, 8, &[
+            pass1,
+            vec![], // pass 2: empty
+            vec![], // pass 3: empty
+            vec![], // pass 4: empty
+            vec![], // pass 5: empty
+            pass6,
+            pass7,
+        ]);
+
+        let png = Png::decode(&file, 1 << 20).unwrap();
+        assert_eq!(png.pixels, vec![42, 7, 99, 100]);
+    }
+
+    #[test]
+    fn rejects_truncated_adam7_stream() {
+        let file = build_adam7_png(2, 2, 0, 8, &[vec![0u8, 42]]); // missing pass 7's data
         let err = Png::decode(&file, 1 << 20).unwrap_err();
-        assert!(matches!(err, DecodeError::UnsupportedInterlace));
+        assert!(matches!(err, DecodeError::TruncatedImageData));
     }
 }

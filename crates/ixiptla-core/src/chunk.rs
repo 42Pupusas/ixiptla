@@ -178,19 +178,19 @@ mod tests {
     use super::{ChunkError, ChunkReader};
     use crate::Crc32;
 
-    fn encode_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    fn encode_chunk(kind: [u8; 4], data: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        out.extend_from_slice(kind);
+        out.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+        out.extend_from_slice(&kind);
         out.extend_from_slice(data);
-        let crc = Crc32::new().update(kind).update(data).finalize();
+        let crc = Crc32::new().update(&kind).update(data).finalize();
         out.extend_from_slice(&crc.to_be_bytes());
         out
     }
 
     #[test]
     fn reads_single_well_formed_chunk() {
-        let stream = encode_chunk(b"IHDR", b"hello");
+        let stream = encode_chunk(*b"IHDR", b"hello");
         let mut reader = ChunkReader::new(&stream);
         let chunk = reader.next_chunk().unwrap().unwrap();
         assert_eq!(&chunk.kind(), b"IHDR");
@@ -200,9 +200,9 @@ mod tests {
 
     #[test]
     fn reads_multiple_chunks_in_sequence() {
-        let mut stream = encode_chunk(b"IHDR", b"abc");
-        stream.extend(encode_chunk(b"IDAT", b"xyz123"));
-        stream.extend(encode_chunk(b"IEND", b""));
+        let mut stream = encode_chunk(*b"IHDR", b"abc");
+        stream.extend(encode_chunk(*b"IDAT", b"xyz123"));
+        stream.extend(encode_chunk(*b"IEND", b""));
 
         let reader = ChunkReader::new(&stream);
         let chunks: Result<Vec<_>, _> = reader.collect();
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn detects_crc_mismatch() {
-        let mut stream = encode_chunk(b"IHDR", b"hello");
+        let mut stream = encode_chunk(*b"IHDR", b"hello");
         // Corrupt one data byte without fixing the CRC.
         let data_start = 8;
         stream[data_start] ^= 0xFF;
@@ -229,7 +229,7 @@ mod tests {
 
     #[test]
     fn detects_truncated_stream() {
-        let stream = encode_chunk(b"IHDR", b"hello world");
+        let stream = encode_chunk(*b"IHDR", b"hello world");
         let truncated = &stream[..stream.len() - 3];
         let mut reader = ChunkReader::new(truncated);
         assert_eq!(reader.next_chunk().unwrap_err(), ChunkError::Truncated);
@@ -237,8 +237,8 @@ mod tests {
 
     #[test]
     fn iterator_stops_after_error_instead_of_looping() {
-        let stream = encode_chunk(b"IHDR", b"hello");
-        let mut broken = stream.clone();
+        let stream = encode_chunk(*b"IHDR", b"hello");
+        let mut broken = stream;
         broken[8] ^= 0xFF; // corrupt data, CRC now wrong
         let reader = ChunkReader::new(&broken);
         let results: Vec<_> = reader.collect();
@@ -248,12 +248,12 @@ mod tests {
 
     #[test]
     fn is_critical_distinguishes_case() {
-        let stream = encode_chunk(b"tEXt", b"comment");
+        let stream = encode_chunk(*b"tEXt", b"comment");
         let mut reader = ChunkReader::new(&stream);
         let chunk = reader.next_chunk().unwrap().unwrap();
         assert!(!chunk.is_critical());
 
-        let stream = encode_chunk(b"IHDR", b"data");
+        let stream = encode_chunk(*b"IHDR", b"data");
         let mut reader = ChunkReader::new(&stream);
         let chunk = reader.next_chunk().unwrap().unwrap();
         assert!(chunk.is_critical());

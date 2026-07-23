@@ -86,14 +86,31 @@ impl Defilter {
 
     /// `Recon(x) = Filt(x) + floor((Recon(a) + Recon(b)) / 2)`.
     //
-    // Indexing (rather than `.iter_mut().enumerate()`) is load-bearing
-    // here: each iteration reads back `content[i - bpp]`, an *already
-    // reconstructed* earlier element of the same slice we're writing --
-    // not expressible as a plain iterator without a second pass.
-    #[allow(clippy::needless_range_loop)]
+    // Split into a branch-free "first pixel" prefix (where `a` is always 0,
+    // per spec §9.2 -- there's no left neighbor) and a branch-free "rest of
+    // row" suffix, instead of testing `i >= bpp` on every byte. Two reasons:
+    //
+    // 1. For `a == 0`, `floor((0 + b) / 2) == b / 2` -- no need to even read
+    //    a phantom left neighbor.
+    // 2. The suffix loop's body has no branch at all now, which both saves
+    //    the per-byte compare and lets each of the `bpp` interleaved
+    //    dependency chains (`content[i]` depends on `content[i - bpp]`, so
+    //    lanes `0..bpp` are mutually independent) pipeline without a branch
+    //    misprediction bubble between them.
+    //
+    // Indexing (rather than `.iter_mut().enumerate()`) is still load-bearing
+    // in the suffix loop: each iteration reads back `content[i - bpp]`, an
+    // *already reconstructed* earlier element of the same slice we're
+    // writing -- not expressible as a plain iterator without a second pass.
     fn undo_average(&self, content: &mut [u8]) {
-        for i in 0..content.len() {
-            let a = if i >= self.bpp { content[i - self.bpp] } else { 0 };
+        let bpp = self.bpp;
+        let prefix_len = bpp.min(content.len());
+        for (byte, &above) in content[..prefix_len].iter_mut().zip(&self.previous_row) {
+            *byte = byte.wrapping_add(above / 2); // a == 0: floor(b/2).
+        }
+        #[allow(clippy::needless_range_loop)]
+        for i in bpp..content.len() {
+            let a = content[i - bpp];
             let b = self.previous_row[i];
             // midpoint, but in a wider type: a + b can be up to 510, which
             // doesn't fit in u8, before the floor-divide brings it back down.
@@ -106,18 +123,27 @@ impl Defilter {
 
     /// `Recon(x) = Filt(x) + PaethPredictor(Recon(a), Recon(b), Recon(c))`.
     //
+    // Same prefix/suffix split as `undo_average` above, for the same two
+    // reasons (skip the phantom-neighbor branch; let the `bpp` independent
+    // dependency chains in the suffix pipeline branch-free). On the first
+    // `bpp` bytes, `a == c == 0`, so `PaethPredictor(0, b, 0)` always
+    // reduces to `b` (`p = b`, `pa = pc = |b|`, `pb = 0 <= pa`, so `b` wins
+    // or ties every comparison against `a`/`c` and wins ties) -- no need to
+    // call the general predictor for those bytes at all.
+    //
     // Same self-referencing-slice reason as `undo_average` above: `a` and
     // `c` read back already-reconstructed earlier elements of `content`.
-    #[allow(clippy::needless_range_loop)]
     fn undo_paeth(&self, content: &mut [u8]) {
-        for i in 0..content.len() {
-            let a = if i >= self.bpp { content[i - self.bpp] } else { 0 };
+        let bpp = self.bpp;
+        let prefix_len = bpp.min(content.len());
+        for (byte, &above) in content[..prefix_len].iter_mut().zip(&self.previous_row) {
+            *byte = byte.wrapping_add(above);
+        }
+        #[allow(clippy::needless_range_loop)]
+        for i in bpp..content.len() {
+            let a = content[i - bpp];
             let b = self.previous_row[i];
-            let c = if i >= self.bpp {
-                self.previous_row[i - self.bpp]
-            } else {
-                0
-            };
+            let c = self.previous_row[i - bpp];
             content[i] = content[i].wrapping_add(Self::paeth_predictor(a, b, c));
         }
     }

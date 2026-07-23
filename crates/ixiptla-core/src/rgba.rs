@@ -83,14 +83,42 @@ impl<'a> RgbaExpander<'a> {
         channels: u32,
         bit_depth: u32,
     ) -> Result<[u8; 4], ExpandError> {
-        let pixel_bits = channels * bit_depth;
-        let bit_offset = x * pixel_bits as usize;
-
         // Read every channel's raw sample up front; each colour type below
-        // just picks how to combine them into RGBA.
+        // just picks how to combine them into RGBA. 8-bit and 16-bit depths
+        // (by far the common case -- every PNG this crate's own benchmarks
+        // and most real-world images use) are byte-aligned: every channel
+        // starts and ends on a byte boundary, so samples can be read
+        // straight out of `row` with plain indexing/`from_be_bytes` instead
+        // of `PixelBits::read`'s bit-by-bit loop (which this fn used to call
+        // unconditionally -- profiling under `perf` via `ixiptla-bench`'s
+        // `decode_loop` showed this was the dominant cost in the whole
+        // decode pipeline, ~8-25x slower than the `png`/`image` crates).
+        // Only the sub-byte depths (1/2/4, exclusive to Grayscale and
+        // IndexedColor per spec §11.2.2) still need actual bit-level
+        // packing, so they alone fall through to `PixelBits`.
         let mut samples = [0u64; 4];
-        for (c, sample) in samples.iter_mut().take(channels as usize).enumerate() {
-            *sample = PixelBits::read(row, bit_offset + c * bit_depth as usize, bit_depth);
+        match bit_depth {
+            8 => {
+                let byte_offset = x * channels as usize;
+                for (c, sample) in samples.iter_mut().take(channels as usize).enumerate() {
+                    *sample = u64::from(row[byte_offset + c]);
+                }
+            }
+            16 => {
+                let byte_offset = x * channels as usize * 2;
+                for (c, sample) in samples.iter_mut().take(channels as usize).enumerate() {
+                    let hi = row[byte_offset + c * 2];
+                    let lo = row[byte_offset + c * 2 + 1];
+                    *sample = u64::from(u16::from_be_bytes([hi, lo]));
+                }
+            }
+            _ => {
+                let pixel_bits = channels * bit_depth;
+                let bit_offset = x * pixel_bits as usize;
+                for (c, sample) in samples.iter_mut().take(channels as usize).enumerate() {
+                    *sample = PixelBits::read(row, bit_offset + c * bit_depth as usize, bit_depth);
+                }
+            }
         }
 
         Ok(match self.ihdr.color_type {

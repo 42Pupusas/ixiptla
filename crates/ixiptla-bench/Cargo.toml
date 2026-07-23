@@ -1,0 +1,43 @@
+[package]
+name = "ixiptla-bench"
+description = "Divan benchmarks for ixiptla-core: internal hotpath coverage plus end-to-end comparisons against the `png` and `image` crates."
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# `src/fixtures.rs` (deterministic synthetic PNG generation, shared by both
+# bench binaries) needs `png` to encode fixtures unconditionally -- kept as
+# a real dependency, not dev-only, for the same reason
+# `ixiptla-conformance/src/reference_decoder.rs` is: both `benches/
+# hotpaths.rs` and `benches/end_to_end.rs` link this crate's compiled lib
+# code, not its `#[cfg(test)]` code.
+ixiptla-core.workspace = true
+png = "0.18"
+# Only needed to hand-assemble the Adam7-interlaced fixture (`png` 0.18's
+# encoder can't write interlaced files -- same limitation documented in
+# ixiptla-conformance's module docs).
+flate2 = "1"
+crc32fast = "1"
+
+[dev-dependencies]
+divan = "0.1"
+# The other real-world decoder end_to_end.rs diffs wall-clock decode time
+# against -- pulled in only for these comparison benchmarks, never by
+# ixiptla-core itself.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[[bench]]
+name = "hotpaths"
+harness = false
+
+[[bench]]
+name = "end_to_end"
+harness = false

@@ -58,6 +58,23 @@ impl<'a> RgbaExpander<'a> {
             return Err(ExpandError::TruncatedPixels);
         }
 
+        // 8-bit TruecolorAlpha is already byte-identical to this fn's own
+        // RGBA8 output: 4 channels, no bit-packing to unpack (bit_depth ==
+        // 8, so `scale_to_u8` would be the identity on every sample), and
+        // no possible tRNS override (spec section 11.3.2 forbids tRNS on
+        // color types that already carry their own alpha channel --
+        // enforced by `Png::decode` rejecting such a chunk before this
+        // ever runs). So for this one very common case (this crate's own
+        // benchmarks' dominant fixture, and probably the single most
+        // common PNG configuration in the wild) the whole per-pixel decode
+        // loop below is provably a no-op transform -- a straight copy of
+        // the raw scanlines is the same bytes (stride == width * 4
+        // exactly at 8-bit depth, so this is contiguous, no padding to
+        // skip).
+        if self.ihdr.color_type == ColorType::TruecolorAlpha && self.ihdr.bit_depth == 8 {
+            return Ok(pixels[..width * height * 4].to_vec());
+        }
+
         let mut out = Vec::with_capacity(width * height * 4);
         let channels = u32::from(self.ihdr.color_type.channel_count());
         let bit_depth = u32::from(self.ihdr.bit_depth);
@@ -299,6 +316,27 @@ mod tests {
         let pixels = [10u8, 20, 30, 128];
         let rgba = expander.expand(&pixels).unwrap();
         assert_eq!(rgba, vec![10, 20, 30, 128]);
+    }
+
+    /// Exercises the `expand`-level fast path for 8-bit `TruecolorAlpha`
+    /// (a straight copy, bypassing `expand_pixel` entirely) across
+    /// multiple pixels/rows -- the single-pixel test above wouldn't catch
+    /// a stride/row-boundary bug in that fast path, since a 1x1 image's
+    /// stride equals its total byte count.
+    #[test]
+    fn expands_8bit_truecolor_alpha_multi_pixel_matches_per_pixel_path() {
+        let ihdr = ihdr(2, 2, 8, ColorType::TruecolorAlpha);
+        let expander = RgbaExpander::new(&ihdr, None, None);
+        // 2x2 image, 4 bytes/pixel: distinct bytes per pixel/channel so a
+        // transposition or off-by-stride bug would show up as a mismatch.
+        let pixels = [
+            1u8, 2, 3, 4, // row 0, pixel 0
+            5, 6, 7, 8, // row 0, pixel 1
+            9, 10, 11, 12, // row 1, pixel 0
+            13, 14, 15, 16, // row 1, pixel 1
+        ];
+        let rgba = expander.expand(&pixels).unwrap();
+        assert_eq!(rgba, pixels.to_vec());
     }
 
     #[test]

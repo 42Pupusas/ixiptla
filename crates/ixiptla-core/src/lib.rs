@@ -17,7 +17,9 @@ mod decoder;
 mod defilter;
 mod filter_type;
 mod ihdr;
+mod palette;
 mod pixel_bits;
+mod rgba;
 mod signature;
 
 pub use adam7::{Adam7, Adam7Pass};
@@ -28,5 +30,7 @@ pub use decoder::{DecodeError, Png};
 pub use defilter::Defilter;
 pub use filter_type::{FilterType, InvalidFilterType};
 pub use ihdr::{Ihdr, IhdrError, InterlaceMethod};
+pub use palette::{Palette, PaletteError};
 pub use pixel_bits::PixelBits;
+pub use rgba::{ExpandError, RgbaExpander};
 pub use signature::{Signature, SignatureError};

@@ -1,0 +1,308 @@
+use crate::{ColorType, Ihdr, Palette, PaletteError, PixelBits};
+
+/// Expands [`crate::Png::pixels`] (raw, defiltered, still in whatever
+/// bit-depth/colour-type `IHDR` declared) into a flat RGBA8 buffer — 4
+/// bytes per pixel, one byte per channel, in image row-major order.
+///
+/// This is a distinct concern from decoding (spec §7/§11.2.3's transforms
+/// are "how to interpret pixel bytes", not "how to reverse filtering/
+/// compression") and from [`Palette`] (which only knows how to look up one
+/// index — nothing about bit-packing or the other 4 colour types). Kept as
+/// its own struct so it owns exactly one job: for every pixel coordinate,
+/// read that pixel's raw sample(s) and produce 4 RGBA8 bytes, regardless
+/// of which of PNG's 5 colour types or 5 bit depths produced the input.
+#[derive(Debug)]
+pub struct RgbaExpander<'a> {
+    ihdr: &'a Ihdr,
+    palette: Option<&'a Palette>,
+}
+
+impl<'a> RgbaExpander<'a> {
+    /// `palette` is required (and used) only for
+    /// [`ColorType::IndexedColor`] images; ignored otherwise.
+    #[must_use]
+    pub const fn new(ihdr: &'a Ihdr, palette: Option<&'a Palette>) -> Self {
+        Self { ihdr, palette }
+    }
+
+    /// Expand `pixels` (as returned by [`crate::Png::decode`]: `height`
+    /// rows of exactly [`Ihdr::stride`] bytes each, no filter-type bytes,
+    /// no interlacing) into `width * height * 4` RGBA8 bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`ExpandError::MissingPalette`] if the image is indexed-color and no
+    /// palette was given to [`Self::new`]. [`ExpandError::Palette`] if an
+    /// index sample points past the palette's end.
+    /// [`ExpandError::TruncatedPixels`] if `pixels` is shorter than
+    /// `height * stride` (should never happen for a `Png` produced by this
+    /// crate's own decoder, but this fn doesn't trust its input blindly).
+    pub fn expand(&self, pixels: &[u8]) -> Result<Vec<u8>, ExpandError> {
+        if self.ihdr.color_type == ColorType::IndexedColor && self.palette.is_none() {
+            return Err(ExpandError::MissingPalette);
+        }
+
+        let stride = self.ihdr.stride();
+        let width = self.ihdr.width as usize;
+        let height = self.ihdr.height as usize;
+        if pixels.len() < stride * height {
+            return Err(ExpandError::TruncatedPixels);
+        }
+
+        let mut out = Vec::with_capacity(width * height * 4);
+        let channels = u32::from(self.ihdr.color_type.channel_count());
+        let bit_depth = u32::from(self.ihdr.bit_depth);
+
+        for y in 0..height {
+            let row = &pixels[y * stride..][..stride];
+            for x in 0..width {
+                let rgba = self.expand_pixel(row, x, channels, bit_depth)?;
+                out.extend_from_slice(&rgba);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Read pixel `x`'s `channels` samples (each `bit_depth` bits, packed
+    /// contiguously — spec §7.2) out of `row` and turn them into one RGBA8
+    /// pixel, per this image's colour type.
+    #[allow(clippy::many_single_char_names)] // r/g/b/a mirror the spec's own channel names
+    fn expand_pixel(
+        &self,
+        row: &[u8],
+        x: usize,
+        channels: u32,
+        bit_depth: u32,
+    ) -> Result<[u8; 4], ExpandError> {
+        let pixel_bits = channels * bit_depth;
+        let bit_offset = x * pixel_bits as usize;
+
+        // Read every channel's raw sample up front; each colour type below
+        // just picks how to combine them into RGBA.
+        let mut samples = [0u64; 4];
+        for (c, sample) in samples.iter_mut().take(channels as usize).enumerate() {
+            *sample = PixelBits::read(row, bit_offset + c * bit_depth as usize, bit_depth);
+        }
+
+        Ok(match self.ihdr.color_type {
+            ColorType::Grayscale => {
+                let v = Self::scale_to_u8(samples[0], bit_depth);
+                [v, v, v, 255]
+            }
+            ColorType::GrayscaleAlpha => {
+                let v = Self::scale_to_u8(samples[0], bit_depth);
+                let a = Self::scale_to_u8(samples[1], bit_depth);
+                [v, v, v, a]
+            }
+            ColorType::Truecolor => {
+                let r = Self::scale_to_u8(samples[0], bit_depth);
+                let g = Self::scale_to_u8(samples[1], bit_depth);
+                let b = Self::scale_to_u8(samples[2], bit_depth);
+                [r, g, b, 255]
+            }
+            ColorType::TruecolorAlpha => {
+                let r = Self::scale_to_u8(samples[0], bit_depth);
+                let g = Self::scale_to_u8(samples[1], bit_depth);
+                let b = Self::scale_to_u8(samples[2], bit_depth);
+                let a = Self::scale_to_u8(samples[3], bit_depth);
+                [r, g, b, a]
+            }
+            ColorType::IndexedColor => {
+                // Checked in `expand`: palette is Some whenever colour
+                // type is IndexedColor.
+                let palette = self.palette.expect("indexed color requires a palette");
+                #[allow(clippy::cast_possible_truncation)]
+                let index = samples[0] as u8; // index bit depth is always <= 8
+                let [r, g, b] = palette.get(index)?;
+                [r, g, b, 255]
+            }
+        })
+    }
+
+    /// Scale a `bit_depth`-wide sample up to the full 8-bit range (spec
+    /// §7.3's "linear" sample scaling: `output = round(input *
+    /// 255 / max_value)`), so a 1-bit sample of 1 becomes 255 (not 1),
+    /// a 4-bit sample of 15 becomes 255, etc. For 8-bit input this is the
+    /// identity; for 16-bit input this keeps only the high byte, which is
+    /// what every 8-bit-per-channel consumer of 16-bit PNGs does.
+    #[allow(clippy::cast_possible_truncation)] // each branch's value is proven <= 255
+    const fn scale_to_u8(sample: u64, bit_depth: u32) -> u8 {
+        if bit_depth == 8 {
+            return sample as u8;
+        }
+        if bit_depth == 16 {
+            return (sample >> 8) as u8;
+        }
+        let max_value = (1u64 << bit_depth) - 1;
+        let scaled = (sample * 255 + max_value / 2) / max_value; // round to nearest
+        scaled as u8
+    }
+}
+
+/// Why [`RgbaExpander::expand`] failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpandError {
+    /// The image is [`ColorType::IndexedColor`] but no [`Palette`] was
+    /// given to [`RgbaExpander::new`].
+    MissingPalette,
+    /// An indexed-color pixel's sample pointed past the palette's end.
+    Palette(PaletteError),
+    /// `pixels` was shorter than `height * stride` bytes.
+    TruncatedPixels,
+}
+
+impl From<PaletteError> for ExpandError {
+    fn from(e: PaletteError) -> Self {
+        Self::Palette(e)
+    }
+}
+
+impl core::fmt::Display for ExpandError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MissingPalette => {
+                write!(f, "indexed-color image requires a PLTE palette to expand")
+            }
+            Self::Palette(e) => write!(f, "{e}"),
+            Self::TruncatedPixels => write!(f, "pixel buffer is shorter than height * stride"),
+        }
+    }
+}
+
+impl std::error::Error for ExpandError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExpandError, RgbaExpander};
+    use crate::{ColorType, Ihdr, InterlaceMethod, Palette};
+
+    fn ihdr(width: u32, height: u32, bit_depth: u8, color_type: ColorType) -> Ihdr {
+        Ihdr {
+            width,
+            height,
+            bit_depth,
+            color_type,
+            interlace: InterlaceMethod::None,
+        }
+    }
+
+    #[test]
+    fn expands_8bit_grayscale_to_rgba() {
+        let ihdr = ihdr(2, 1, 8, ColorType::Grayscale);
+        let expander = RgbaExpander::new(&ihdr, None);
+        let pixels = [0u8, 128, 255, 0]; // padding irrelevant; stride=2
+        let rgba = expander.expand(&pixels[..2]).unwrap();
+        assert_eq!(rgba, vec![0, 0, 0, 255, 128, 128, 128, 255]);
+    }
+
+    #[test]
+    fn expands_1bit_grayscale_scaling_to_full_range() {
+        // 1-bit grayscale, width 8: byte 0b1010_0000 -> pixels 1,0,1,0,0,0,0,0
+        let ihdr = ihdr(8, 1, 1, ColorType::Grayscale);
+        let expander = RgbaExpander::new(&ihdr, None);
+        let pixels = [0b1010_0000u8];
+        let rgba = expander.expand(&pixels).unwrap();
+        assert_eq!(&rgba[0..4], &[255, 255, 255, 255]); // pixel 0: 1 -> 255
+        assert_eq!(&rgba[4..8], &[0, 0, 0, 255]); // pixel 1: 0 -> 0
+        assert_eq!(&rgba[8..12], &[255, 255, 255, 255]); // pixel 2: 1 -> 255
+    }
+
+    #[test]
+    fn expands_4bit_grayscale_replicates_nibble() {
+        // 4-bit grayscale: max sample 15 -> 255, sample 8 -> round(8*255/15)=136
+        let ihdr = ihdr(2, 1, 4, ColorType::Grayscale);
+        let expander = RgbaExpander::new(&ihdr, None);
+        let pixels = [0b1111_1000u8]; // pixel0=15, pixel1=8
+        let rgba = expander.expand(&pixels).unwrap();
+        assert_eq!(&rgba[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&rgba[4..8], &[136, 136, 136, 255]);
+    }
+
+    #[test]
+    fn expands_8bit_truecolor() {
+        let ihdr = ihdr(1, 1, 8, ColorType::Truecolor);
+        let expander = RgbaExpander::new(&ihdr, None);
+        let pixels = [10u8, 20, 30];
+        let rgba = expander.expand(&pixels).unwrap();
+        assert_eq!(rgba, vec![10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn expands_8bit_truecolor_alpha() {
+        let ihdr = ihdr(1, 1, 8, ColorType::TruecolorAlpha);
+        let expander = RgbaExpander::new(&ihdr, None);
+        let pixels = [10u8, 20, 30, 128];
+        let rgba = expander.expand(&pixels).unwrap();
+        assert_eq!(rgba, vec![10, 20, 30, 128]);
+    }
+
+    #[test]
+    fn expands_8bit_grayscale_alpha() {
+        let ihdr = ihdr(1, 1, 8, ColorType::GrayscaleAlpha);
+        let expander = RgbaExpander::new(&ihdr, None);
+        let pixels = [200u8, 50];
+        let rgba = expander.expand(&pixels).unwrap();
+        assert_eq!(rgba, vec![200, 200, 200, 50]);
+    }
+
+    #[test]
+    fn expands_16bit_truecolor_keeps_high_byte() {
+        let ihdr = ihdr(1, 1, 16, ColorType::Truecolor);
+        let expander = RgbaExpander::new(&ihdr, None);
+        // R = 0xABCD -> high byte 0xAB; G = 0x0102 -> 0x01; B = 0xFFFF -> 0xFF
+        let pixels = [0xAB, 0xCD, 0x01, 0x02, 0xFF, 0xFF];
+        let rgba = expander.expand(&pixels).unwrap();
+        assert_eq!(rgba, vec![0xAB, 0x01, 0xFF, 255]);
+    }
+
+    #[test]
+    fn expands_indexed_color_via_palette() {
+        let ihdr = ihdr(2, 1, 8, ColorType::IndexedColor);
+        let palette_data = [10u8, 20, 30, 40, 50, 60]; // 2 entries
+        let palette = Palette::parse(&palette_data).unwrap();
+        let expander = RgbaExpander::new(&ihdr, Some(&palette));
+        let pixels = [1u8, 0]; // index 1, then index 0
+        let rgba = expander.expand(&pixels).unwrap();
+        assert_eq!(rgba, vec![40, 50, 60, 255, 10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn indexed_color_without_palette_is_an_error() {
+        let ihdr = ihdr(1, 1, 8, ColorType::IndexedColor);
+        let expander = RgbaExpander::new(&ihdr, None);
+        let err = expander.expand(&[0]).unwrap_err();
+        assert_eq!(err, ExpandError::MissingPalette);
+    }
+
+    #[test]
+    fn indexed_color_out_of_range_index_is_an_error() {
+        let ihdr = ihdr(1, 1, 8, ColorType::IndexedColor);
+        let palette = Palette::parse(&[1, 2, 3]).unwrap(); // 1 entry
+        let expander = RgbaExpander::new(&ihdr, Some(&palette));
+        let err = expander.expand(&[5]).unwrap_err(); // index 5, out of range
+        assert!(matches!(err, ExpandError::Palette(_)));
+    }
+
+    #[test]
+    fn rejects_truncated_pixel_buffer() {
+        let ihdr = ihdr(4, 4, 8, ColorType::Grayscale); // needs 16 bytes
+        let expander = RgbaExpander::new(&ihdr, None);
+        let err = expander.expand(&[0u8; 4]).unwrap_err();
+        assert_eq!(err, ExpandError::TruncatedPixels);
+    }
+
+    #[test]
+    fn expands_2bit_indexed_color_with_sub_byte_packing() {
+        // 2-bit indexed, width 4: one byte packs all 4 pixels' indices.
+        let ihdr = ihdr(4, 1, 2, ColorType::IndexedColor);
+        let palette_data = [0u8, 0, 0, 10, 10, 10, 20, 20, 20, 30, 30, 30];
+        let palette = Palette::parse(&palette_data).unwrap();
+        let expander = RgbaExpander::new(&ihdr, Some(&palette));
+        let pixels = [0b00_01_10_11u8]; // indices 0,1,2,3
+        let rgba = expander.expand(&pixels).unwrap();
+        assert_eq!(
+            rgba,
+            vec![0, 0, 0, 255, 10, 10, 10, 255, 20, 20, 20, 255, 30, 30, 30, 255]
+        );
+    }
+}

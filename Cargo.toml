@@ -29,3 +29,15 @@ missing_errors_doc = "allow"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Same codegen as [profile.release] (so `perf` sees the exact same
+# optimized machine code, not a debug build with a totally different
+# hot-loop shape) but keeping symbols and line-table debug info instead
+# of stripping them -- `cargo/perf` tool's `record` target builds with
+# this profile so `perf report`'s call graph shows real function names
+# (and, with a DWARF-aware `perf`, source lines) instead of bare hex
+# offsets like `[.] 0x0000000000032cc6`.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = true

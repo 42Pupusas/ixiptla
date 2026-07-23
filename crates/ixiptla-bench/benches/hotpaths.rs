@@ -10,11 +10,24 @@
 //! `Defilter` benchmarks operate on already-inflated `IDAT` bytes, not a
 //! whole PNG file), isolating that stage's own cost from zlib inflate,
 //! chunk parsing, etc.
+//!
+//! The global allocator below is wrapped in `divan::AllocProfiler`, so
+//! every result also reports alloc/dealloc/grow counts and byte totals
+//! alongside timing -- lets a slowdown be diagnosed as "more CPU work"
+//! vs. "more allocator churn" without a separate profiling pass.
 
 use divan::Bencher;
 use ixiptla_bench::fixtures::{SquareFixture, BENCH_SIDES};
 use ixiptla_core::{ColorType, Defilter, Ihdr, InterlaceMethod, Png, RgbaExpander};
 use png::ColorType as PngColorType;
+
+// Wraps the system allocator so divan reports per-benchmark allocation
+// counts/bytes alongside timing -- lets us see e.g. that
+// `rgba_expand_*` allocates exactly one output Vec per call (as
+// expected) versus catching an accidental extra allocation regression
+// in the hotpath without needing a separate profiling run.
+#[global_allocator]
+static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
 
 fn main() {
     divan::main();

@@ -10,6 +10,12 @@
 //! normalize to one full RGBA8/equivalent buffer, so this measures
 //! comparable work per decoder rather than "decode API surface
 //! convenience".
+//!
+//! The global allocator below is wrapped in `divan::AllocProfiler`, so
+//! every result also reports each decoder's alloc/dealloc/grow counts
+//! and byte totals alongside timing -- useful for telling apart "this
+//! decoder is slower because it does more CPU work per byte" from "this
+//! decoder is slower because it allocates/copies more".
 
 use divan::Bencher;
 use image::ImageDecoder as _;
@@ -17,6 +23,14 @@ use ixiptla_bench::fixtures::{SquareFixture, BENCH_SIDES};
 use ixiptla_core::{Png, RgbaExpander};
 use png::{ColorType as PngColorType, Transformations};
 use std::io::Cursor;
+
+// Wraps the system allocator so divan reports per-benchmark allocation
+// counts/bytes alongside timing for each of the three decoders -- a
+// decoder being merely "slower" versus "allocates far more" call for
+// different fixes, and this makes the difference visible without a
+// separate profiling run.
+#[global_allocator]
+static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
 
 fn main() {
     divan::main();

@@ -25,12 +25,21 @@
 //! `ixiptla_core::Png::decode` and the `png` crate's *decoder* (which does
 //! support Adam7) for comparison — the goal is diffing decode behavior,
 //! not exercising `png`'s encoder for this one case.
+//!
+//! The shared "decode both ways and diff the RGBA8 bytes" logic lives in
+//! [`reference_decoder::ReferenceComparison`] rather than only inside
+//! `#[cfg(test)]` here, so `tests/pngsuite.rs` — a *separate* test binary
+//! that only links this crate's compiled (non-`#[cfg(test)]`) lib code —
+//! can reach it too, to diff-test against the real-world `PngSuite`
+//! corpus alongside the synthetic fixtures built below.
+
+pub mod reference_decoder;
 
 #[cfg(test)]
 mod tests {
-    use ixiptla_core::{Png, RgbaExpander};
-    use png::{BitDepth, ColorType as PngColorType, Encoder, Info, Transformations};
-    use std::io::{Cursor, Write as _};
+    use crate::reference_decoder::ReferenceComparison;
+    use png::{BitDepth, ColorType as PngColorType, Encoder, Info};
+    use std::io::Write as _;
 
     /// A small deterministic (not truly random, just varied-looking)
     /// pixel generator, so every test image has non-trivial content —
@@ -93,66 +102,6 @@ mod tests {
         writer.write_image_data(raw).unwrap();
         writer.finish().unwrap();
         out
-    }
-
-    /// Decode `file` with the `png` crate, normalized to RGBA8.
-    ///
-    /// `EXPAND | ALPHA | STRIP_16` gets every color type to "8 bits/
-    /// sample, alpha present", but `png` 0.18 has no built-in "replicate
-    /// gray into R/G/B" transform (that flag exists in some other PNG
-    /// libraries under the name `GRAY_TO_RGB`, not this crate) — so
-    /// grayscale/grayscale+alpha output is still 1 or 2 samples/pixel
-    /// here; `normalize_to_rgba8` below does that replication by hand so
-    /// both sides land on the same 4-bytes/pixel layout
-    /// `ixiptla_core::RgbaExpander` produces.
-    fn decode_with_png_crate(file: &[u8]) -> Vec<u8> {
-        let mut decoder = png::Decoder::new(Cursor::new(file));
-        decoder.set_transformations(
-            Transformations::EXPAND | Transformations::ALPHA | Transformations::STRIP_16,
-        );
-        let mut reader = decoder.read_info().unwrap();
-        let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
-        let info = reader.next_frame(&mut buf).unwrap();
-        buf.truncate(info.buffer_size());
-        normalize_to_rgba8(&buf, reader.output_color_type().0)
-    }
-
-    /// Replicate grayscale (with `EXPAND | ALPHA` already applied, so 1
-    /// sample + 1 alpha byte/pixel) into an RGBA quad; pass RGBA-shaped
-    /// data straight through unchanged.
-    fn normalize_to_rgba8(buf: &[u8], color_type: PngColorType) -> Vec<u8> {
-        match color_type {
-            PngColorType::Grayscale => {
-                buf.iter().flat_map(|&v| [v, v, v, 255]).collect()
-            }
-            PngColorType::GrayscaleAlpha => buf
-                .chunks_exact(2)
-                .flat_map(|px| [px[0], px[0], px[0], px[1]])
-                .collect(),
-            PngColorType::Rgba => buf.to_vec(),
-            other => panic!("unexpected post-EXPAND|ALPHA color type: {other:?}"),
-        }
-    }
-
-    /// Decode `file` with `ixiptla_core`, expanded to RGBA8.
-    fn decode_with_ixiptla(file: &[u8]) -> Vec<u8> {
-        let decoded = Png::decode(file, 1 << 24).unwrap();
-        let expander = RgbaExpander::new(
-            &decoded.ihdr,
-            decoded.palette.as_ref(),
-            decoded.transparency.as_ref(),
-        );
-        expander.expand(&decoded.pixels).unwrap()
-    }
-
-    /// Assert both decoders agree, pixel-for-pixel, on this exact file.
-    fn assert_matches_reference(file: &[u8]) {
-        let reference = decode_with_png_crate(file);
-        let ours = decode_with_ixiptla(file);
-        assert_eq!(
-            ours, reference,
-            "ixiptla-core's RGBA8 output diverges from the `png` crate's for this file"
-        );
     }
 
     /// Generate `width * height * samples_per_pixel` raw sample bytes at
@@ -279,7 +228,7 @@ mod tests {
             palette: None,
             trns: None,
         };
-        assert_matches_reference(&encode_with_png_crate(&spec, &raw));
+        ReferenceComparison::assert_matches(&encode_with_png_crate(&spec, &raw));
     }
 
     #[test]
@@ -293,7 +242,7 @@ mod tests {
             palette: None,
             trns: None,
         };
-        assert_matches_reference(&encode_with_png_crate(&spec, &raw));
+        ReferenceComparison::assert_matches(&encode_with_png_crate(&spec, &raw));
     }
 
     #[test]
@@ -307,7 +256,7 @@ mod tests {
             palette: None,
             trns: None,
         };
-        assert_matches_reference(&encode_with_png_crate(&spec, &raw));
+        ReferenceComparison::assert_matches(&encode_with_png_crate(&spec, &raw));
     }
 
     #[test]
@@ -321,7 +270,7 @@ mod tests {
             palette: None,
             trns: None,
         };
-        assert_matches_reference(&encode_with_png_crate(&spec, &raw));
+        ReferenceComparison::assert_matches(&encode_with_png_crate(&spec, &raw));
     }
 
     #[test]
@@ -338,7 +287,7 @@ mod tests {
             palette: Some(&palette),
             trns: None,
         };
-        assert_matches_reference(&encode_with_png_crate(&spec, &raw));
+        ReferenceComparison::assert_matches(&encode_with_png_crate(&spec, &raw));
     }
 
     #[test]
@@ -355,7 +304,7 @@ mod tests {
             palette: Some(&palette),
             trns: Some(&trns),
         };
-        assert_matches_reference(&encode_with_png_crate(&spec, &raw));
+        ReferenceComparison::assert_matches(&encode_with_png_crate(&spec, &raw));
     }
 
     #[test]
@@ -374,7 +323,7 @@ mod tests {
             palette: None,
             trns: Some(&trns),
         };
-        assert_matches_reference(&encode_with_png_crate(&spec, &raw));
+        ReferenceComparison::assert_matches(&encode_with_png_crate(&spec, &raw));
     }
 
     #[test]
@@ -391,14 +340,14 @@ mod tests {
             palette: None,
             trns: Some(&trns),
         };
-        assert_matches_reference(&encode_with_png_crate(&spec, &raw));
+        ReferenceComparison::assert_matches(&encode_with_png_crate(&spec, &raw));
     }
 
     #[test]
     fn matches_reference_for_adam7_interlaced_truecolor() {
         let raw = random_raw_adam7(13, 11, 3, 0x009E_9E9E);
         let file = build_adam7_png(13, 11, PngColorType::Rgb, None, &raw, 3);
-        assert_matches_reference(&file);
+        ReferenceComparison::assert_matches(&file);
     }
 
     #[test]
@@ -412,7 +361,7 @@ mod tests {
             .map(|b| b % 3)
             .collect();
         let file = build_adam7_png(13, 11, PngColorType::Indexed, Some(&palette), &raw, 1);
-        assert_matches_reference(&file);
+        ReferenceComparison::assert_matches(&file);
     }
 
     #[test]
@@ -429,7 +378,7 @@ mod tests {
             palette: None,
             trns: None,
         };
-        assert_matches_reference(&encode_with_png_crate(&spec, &raw));
+        ReferenceComparison::assert_matches(&encode_with_png_crate(&spec, &raw));
     }
 
     #[test]
@@ -446,7 +395,7 @@ mod tests {
             palette: Some(&palette),
             trns: None,
         };
-        assert_matches_reference(&encode_with_png_crate(&spec, &raw));
+        ReferenceComparison::assert_matches(&encode_with_png_crate(&spec, &raw));
     }
 
     #[test]
@@ -461,6 +410,6 @@ mod tests {
             palette: None,
             trns: None,
         };
-        assert_matches_reference(&encode_with_png_crate(&spec, &raw));
+        ReferenceComparison::assert_matches(&encode_with_png_crate(&spec, &raw));
     }
 }

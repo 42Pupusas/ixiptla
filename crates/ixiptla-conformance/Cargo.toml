@@ -13,9 +13,14 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-
-[dev-dependencies]
+# `png` (not `ixiptla-core`, which stays dev-only below) is a real
+# dependency here: `src/reference_decoder.rs` is compiled unconditionally
+# (not `#[cfg(test)]`) so both this crate's own unit tests *and* the
+# `tests/pngsuite.rs` integration test binary -- which links the compiled
+# lib without its `#[cfg(test)]` code -- can reach it.
 ixiptla-core.workspace = true
 png = "0.18"
+
+[dev-dependencies]
 flate2 = "1"
 crc32fast = "1"

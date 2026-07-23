@@ -21,6 +21,7 @@ mod palette;
 mod pixel_bits;
 mod rgba;
 mod signature;
+mod transparency;
 
 pub use adam7::{Adam7, Adam7Pass};
 pub use chunk::{Chunk, ChunkError, ChunkReader};
@@ -34,3 +35,4 @@ pub use palette::{Palette, PaletteError};
 pub use pixel_bits::PixelBits;
 pub use rgba::{ExpandError, RgbaExpander};
 pub use signature::{Signature, SignatureError};
+pub use transparency::{Transparency, TransparencyError};

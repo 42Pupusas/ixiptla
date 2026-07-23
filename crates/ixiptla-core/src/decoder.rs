@@ -1,6 +1,7 @@
 use crate::{
     Adam7, ChunkError, ChunkReader, ColorType, Defilter, Ihdr, IhdrError, InterlaceMethod,
-    InvalidFilterType, Palette, PaletteError, Signature, SignatureError,
+    InvalidFilterType, Palette, PaletteError, Signature, SignatureError, Transparency,
+    TransparencyError,
 };
 
 /// A decoded PNG: its header metadata plus the raw, defiltered pixel bytes
@@ -25,6 +26,13 @@ pub struct Png {
     /// truecolor/truecolor-alpha images, where `PLTE` is an optional
     /// suggested-palette hint rather than something pixel bytes reference.
     pub palette: Option<Palette>,
+    /// The `tRNS` chunk, parsed if present (spec §11.3.2: simple
+    /// transparency for color types without their own alpha channel).
+    /// Always `None` for [`crate::ColorType::GrayscaleAlpha`]/
+    /// [`crate::ColorType::TruecolorAlpha`] images — [`Self::decode`]
+    /// rejects a `tRNS` chunk there rather than silently ignoring
+    /// conflicting transparency data.
+    pub transparency: Option<Transparency>,
 }
 
 impl Png {
@@ -55,10 +63,14 @@ impl Png {
         // otherwise-decodable file), just take whichever PLTE data we see.
         let mut idat = Vec::new();
         let mut palette = None;
+        let mut transparency = None;
         while let Some(chunk) = reader.next_chunk()? {
             match chunk.kind_str() {
                 Some("IDAT") => idat.extend_from_slice(chunk.data()),
                 Some("PLTE") => palette = Some(Palette::parse(chunk.data())?),
+                Some("tRNS") => {
+                    transparency = Some(Transparency::parse(ihdr.color_type, chunk.data())?);
+                }
                 Some("IEND") => break,
                 _ => {} // ancillary or unhandled critical chunk: skip for now
             }
@@ -77,7 +89,7 @@ impl Png {
             InterlaceMethod::Adam7 => Self::defilter_adam7(&ihdr, &inflated)?,
         };
 
-        Ok(Self { ihdr, pixels, palette })
+        Ok(Self { ihdr, pixels, palette, transparency })
     }
 
     /// Defilter a non-interlaced `IDAT` stream: one flat sequence of
@@ -176,6 +188,7 @@ pub enum DecodeError {
     /// present (spec §11.2.3: mandatory for indexed color).
     MissingPalette,
     Palette(PaletteError),
+    Transparency(TransparencyError),
     /// The inflated `IDAT` stream's length isn't a whole number of
     /// `1 + stride`-byte scanlines.
     TruncatedImageData,
@@ -222,6 +235,12 @@ impl From<PaletteError> for DecodeError {
     }
 }
 
+impl From<TransparencyError> for DecodeError {
+    fn from(e: TransparencyError) -> Self {
+        Self::Transparency(e)
+    }
+}
+
 impl core::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -234,6 +253,7 @@ impl core::fmt::Display for DecodeError {
                 write!(f, "indexed-color image has no PLTE chunk")
             }
             Self::Palette(e) => write!(f, "{e}"),
+            Self::Transparency(e) => write!(f, "{e}"),
             Self::TruncatedImageData => {
                 write!(f, "inflated IDAT data is not a whole number of scanlines")
             }
@@ -488,5 +508,41 @@ mod tests {
         let file = build_png(2, 2, 0, &raw);
         let png = Png::decode(&file, 1 << 20).unwrap();
         assert!(png.palette.is_none());
+    }
+
+    #[test]
+    fn parses_trns_chunk_for_grayscale_image() {
+        let mut file = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut ihdr_data = Vec::new();
+        ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+        ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+        ihdr_data.extend_from_slice(&[8, 0, 0, 0, 0]);
+        file.extend(encode_chunk(*b"IHDR", &ihdr_data));
+        file.extend(encode_chunk(*b"tRNS", &[0x00, 0x2A])); // transparent sample 42
+        let raw = [0u8, 42];
+        let zlib_data = ixchel::zlib::compress(&raw);
+        file.extend(encode_chunk(*b"IDAT", &zlib_data));
+        file.extend(encode_chunk(*b"IEND", b""));
+
+        let png = Png::decode(&file, 1 << 20).unwrap();
+        assert!(png.transparency.is_some());
+    }
+
+    #[test]
+    fn rejects_trns_on_alpha_color_type() {
+        let mut file = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut ihdr_data = Vec::new();
+        ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+        ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+        ihdr_data.extend_from_slice(&[8, 4, 0, 0, 0]); // grayscale+alpha
+        file.extend(encode_chunk(*b"IHDR", &ihdr_data));
+        file.extend(encode_chunk(*b"tRNS", &[0x00, 0x2A]));
+        let raw = [0u8, 42, 255];
+        let zlib_data = ixchel::zlib::compress(&raw);
+        file.extend(encode_chunk(*b"IDAT", &zlib_data));
+        file.extend(encode_chunk(*b"IEND", b""));
+
+        let err = Png::decode(&file, 1 << 20).unwrap_err();
+        assert!(matches!(err, DecodeError::Transparency(_)));
     }
 }

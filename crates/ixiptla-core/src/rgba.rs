@@ -1,4 +1,4 @@
-use crate::{ColorType, Ihdr, Palette, PaletteError, PixelBits};
+use crate::{ColorType, Ihdr, Palette, PaletteError, PixelBits, Transparency};
 
 /// Expands [`crate::Png::pixels`] (raw, defiltered, still in whatever
 /// bit-depth/colour-type `IHDR` declared) into a flat RGBA8 buffer — 4
@@ -15,14 +15,23 @@ use crate::{ColorType, Ihdr, Palette, PaletteError, PixelBits};
 pub struct RgbaExpander<'a> {
     ihdr: &'a Ihdr,
     palette: Option<&'a Palette>,
+    transparency: Option<&'a Transparency>,
 }
 
 impl<'a> RgbaExpander<'a> {
     /// `palette` is required (and used) only for
-    /// [`ColorType::IndexedColor`] images; ignored otherwise.
+    /// [`ColorType::IndexedColor`] images; ignored otherwise. `transparency`
+    /// (spec §11.3.2's `tRNS`) is optional for every colour type it can
+    /// apply to — when given, it overrides the alpha this would otherwise
+    /// produce (255, or the palette-index lookup) for pixels matching the
+    /// designated transparent sample/colour/index.
     #[must_use]
-    pub const fn new(ihdr: &'a Ihdr, palette: Option<&'a Palette>) -> Self {
-        Self { ihdr, palette }
+    pub const fn new(
+        ihdr: &'a Ihdr,
+        palette: Option<&'a Palette>,
+        transparency: Option<&'a Transparency>,
+    ) -> Self {
+        Self { ihdr, palette, transparency }
     }
 
     /// Expand `pixels` (as returned by [`crate::Png::decode`]: `height`
@@ -87,7 +96,11 @@ impl<'a> RgbaExpander<'a> {
         Ok(match self.ihdr.color_type {
             ColorType::Grayscale => {
                 let v = Self::scale_to_u8(samples[0], bit_depth);
-                [v, v, v, 255]
+                // tRNS (spec §11.3.2) compares the *raw* sample, at the
+                // image's own bit depth, not the scaled 8-bit output.
+                #[allow(clippy::cast_possible_truncation)]
+                let a = if self.is_transparent_gray(samples[0]) { 0 } else { 255 };
+                [v, v, v, a]
             }
             ColorType::GrayscaleAlpha => {
                 let v = Self::scale_to_u8(samples[0], bit_depth);
@@ -98,7 +111,12 @@ impl<'a> RgbaExpander<'a> {
                 let r = Self::scale_to_u8(samples[0], bit_depth);
                 let g = Self::scale_to_u8(samples[1], bit_depth);
                 let b = Self::scale_to_u8(samples[2], bit_depth);
-                [r, g, b, 255]
+                let a = if self.is_transparent_rgb(samples[0], samples[1], samples[2]) {
+                    0
+                } else {
+                    255
+                };
+                [r, g, b, a]
             }
             ColorType::TruecolorAlpha => {
                 let r = Self::scale_to_u8(samples[0], bit_depth);
@@ -114,9 +132,28 @@ impl<'a> RgbaExpander<'a> {
                 #[allow(clippy::cast_possible_truncation)]
                 let index = samples[0] as u8; // index bit depth is always <= 8
                 let [r, g, b] = palette.get(index)?;
-                [r, g, b, 255]
+                let a = self
+                    .transparency
+                    .map_or(255, |t| t.alpha_for_index(index));
+                [r, g, b, a]
             }
         })
+    }
+
+    /// Whether raw grayscale `sample` (at the image's own bit depth) is
+    /// `tRNS`'s designated transparent value.
+    fn is_transparent_gray(&self, sample: u64) -> bool {
+        #[allow(clippy::cast_possible_truncation)] // grayscale samples are always <= 16 bits
+        let sample = sample as u16;
+        self.transparency.is_some_and(|t| t.is_transparent_gray(sample))
+    }
+
+    /// Whether raw truecolor `(r, g, b)` (at the image's own bit depth) is
+    /// `tRNS`'s designated transparent colour.
+    fn is_transparent_rgb(&self, r: u64, g: u64, b: u64) -> bool {
+        #[allow(clippy::cast_possible_truncation)] // truecolor samples are always <= 16 bits
+        let (r, g, b) = (r as u16, g as u16, b as u16);
+        self.transparency.is_some_and(|t| t.is_transparent_rgb(r, g, b))
     }
 
     /// Scale a `bit_depth`-wide sample up to the full 8-bit range (spec
@@ -174,7 +211,7 @@ impl std::error::Error for ExpandError {}
 #[cfg(test)]
 mod tests {
     use super::{ExpandError, RgbaExpander};
-    use crate::{ColorType, Ihdr, InterlaceMethod, Palette};
+    use crate::{ColorType, Ihdr, InterlaceMethod, Palette, Transparency};
 
     fn ihdr(width: u32, height: u32, bit_depth: u8, color_type: ColorType) -> Ihdr {
         Ihdr {
@@ -189,7 +226,7 @@ mod tests {
     #[test]
     fn expands_8bit_grayscale_to_rgba() {
         let ihdr = ihdr(2, 1, 8, ColorType::Grayscale);
-        let expander = RgbaExpander::new(&ihdr, None);
+        let expander = RgbaExpander::new(&ihdr, None, None);
         let pixels = [0u8, 128, 255, 0]; // padding irrelevant; stride=2
         let rgba = expander.expand(&pixels[..2]).unwrap();
         assert_eq!(rgba, vec![0, 0, 0, 255, 128, 128, 128, 255]);
@@ -199,7 +236,7 @@ mod tests {
     fn expands_1bit_grayscale_scaling_to_full_range() {
         // 1-bit grayscale, width 8: byte 0b1010_0000 -> pixels 1,0,1,0,0,0,0,0
         let ihdr = ihdr(8, 1, 1, ColorType::Grayscale);
-        let expander = RgbaExpander::new(&ihdr, None);
+        let expander = RgbaExpander::new(&ihdr, None, None);
         let pixels = [0b1010_0000u8];
         let rgba = expander.expand(&pixels).unwrap();
         assert_eq!(&rgba[0..4], &[255, 255, 255, 255]); // pixel 0: 1 -> 255
@@ -211,7 +248,7 @@ mod tests {
     fn expands_4bit_grayscale_replicates_nibble() {
         // 4-bit grayscale: max sample 15 -> 255, sample 8 -> round(8*255/15)=136
         let ihdr = ihdr(2, 1, 4, ColorType::Grayscale);
-        let expander = RgbaExpander::new(&ihdr, None);
+        let expander = RgbaExpander::new(&ihdr, None, None);
         let pixels = [0b1111_1000u8]; // pixel0=15, pixel1=8
         let rgba = expander.expand(&pixels).unwrap();
         assert_eq!(&rgba[0..4], &[255, 255, 255, 255]);
@@ -221,7 +258,7 @@ mod tests {
     #[test]
     fn expands_8bit_truecolor() {
         let ihdr = ihdr(1, 1, 8, ColorType::Truecolor);
-        let expander = RgbaExpander::new(&ihdr, None);
+        let expander = RgbaExpander::new(&ihdr, None, None);
         let pixels = [10u8, 20, 30];
         let rgba = expander.expand(&pixels).unwrap();
         assert_eq!(rgba, vec![10, 20, 30, 255]);
@@ -230,7 +267,7 @@ mod tests {
     #[test]
     fn expands_8bit_truecolor_alpha() {
         let ihdr = ihdr(1, 1, 8, ColorType::TruecolorAlpha);
-        let expander = RgbaExpander::new(&ihdr, None);
+        let expander = RgbaExpander::new(&ihdr, None, None);
         let pixels = [10u8, 20, 30, 128];
         let rgba = expander.expand(&pixels).unwrap();
         assert_eq!(rgba, vec![10, 20, 30, 128]);
@@ -239,7 +276,7 @@ mod tests {
     #[test]
     fn expands_8bit_grayscale_alpha() {
         let ihdr = ihdr(1, 1, 8, ColorType::GrayscaleAlpha);
-        let expander = RgbaExpander::new(&ihdr, None);
+        let expander = RgbaExpander::new(&ihdr, None, None);
         let pixels = [200u8, 50];
         let rgba = expander.expand(&pixels).unwrap();
         assert_eq!(rgba, vec![200, 200, 200, 50]);
@@ -248,7 +285,7 @@ mod tests {
     #[test]
     fn expands_16bit_truecolor_keeps_high_byte() {
         let ihdr = ihdr(1, 1, 16, ColorType::Truecolor);
-        let expander = RgbaExpander::new(&ihdr, None);
+        let expander = RgbaExpander::new(&ihdr, None, None);
         // R = 0xABCD -> high byte 0xAB; G = 0x0102 -> 0x01; B = 0xFFFF -> 0xFF
         let pixels = [0xAB, 0xCD, 0x01, 0x02, 0xFF, 0xFF];
         let rgba = expander.expand(&pixels).unwrap();
@@ -260,7 +297,7 @@ mod tests {
         let ihdr = ihdr(2, 1, 8, ColorType::IndexedColor);
         let palette_data = [10u8, 20, 30, 40, 50, 60]; // 2 entries
         let palette = Palette::parse(&palette_data).unwrap();
-        let expander = RgbaExpander::new(&ihdr, Some(&palette));
+        let expander = RgbaExpander::new(&ihdr, Some(&palette), None);
         let pixels = [1u8, 0]; // index 1, then index 0
         let rgba = expander.expand(&pixels).unwrap();
         assert_eq!(rgba, vec![40, 50, 60, 255, 10, 20, 30, 255]);
@@ -269,7 +306,7 @@ mod tests {
     #[test]
     fn indexed_color_without_palette_is_an_error() {
         let ihdr = ihdr(1, 1, 8, ColorType::IndexedColor);
-        let expander = RgbaExpander::new(&ihdr, None);
+        let expander = RgbaExpander::new(&ihdr, None, None);
         let err = expander.expand(&[0]).unwrap_err();
         assert_eq!(err, ExpandError::MissingPalette);
     }
@@ -278,7 +315,7 @@ mod tests {
     fn indexed_color_out_of_range_index_is_an_error() {
         let ihdr = ihdr(1, 1, 8, ColorType::IndexedColor);
         let palette = Palette::parse(&[1, 2, 3]).unwrap(); // 1 entry
-        let expander = RgbaExpander::new(&ihdr, Some(&palette));
+        let expander = RgbaExpander::new(&ihdr, Some(&palette), None);
         let err = expander.expand(&[5]).unwrap_err(); // index 5, out of range
         assert!(matches!(err, ExpandError::Palette(_)));
     }
@@ -286,7 +323,7 @@ mod tests {
     #[test]
     fn rejects_truncated_pixel_buffer() {
         let ihdr = ihdr(4, 4, 8, ColorType::Grayscale); // needs 16 bytes
-        let expander = RgbaExpander::new(&ihdr, None);
+        let expander = RgbaExpander::new(&ihdr, None, None);
         let err = expander.expand(&[0u8; 4]).unwrap_err();
         assert_eq!(err, ExpandError::TruncatedPixels);
     }
@@ -297,12 +334,48 @@ mod tests {
         let ihdr = ihdr(4, 1, 2, ColorType::IndexedColor);
         let palette_data = [0u8, 0, 0, 10, 10, 10, 20, 20, 20, 30, 30, 30];
         let palette = Palette::parse(&palette_data).unwrap();
-        let expander = RgbaExpander::new(&ihdr, Some(&palette));
+        let expander = RgbaExpander::new(&ihdr, Some(&palette), None);
         let pixels = [0b00_01_10_11u8]; // indices 0,1,2,3
         let rgba = expander.expand(&pixels).unwrap();
         assert_eq!(
             rgba,
             vec![0, 0, 0, 255, 10, 10, 10, 255, 20, 20, 20, 255, 30, 30, 30, 255]
         );
+    }
+
+    #[test]
+    fn trns_makes_matching_grayscale_sample_transparent() {
+        let ihdr = ihdr(2, 1, 8, ColorType::Grayscale);
+        let trns = Transparency::parse(ColorType::Grayscale, &[0x00, 0x80]).unwrap(); // sample 128
+        let expander = RgbaExpander::new(&ihdr, None, Some(&trns));
+        let pixels = [128u8, 200];
+        let rgba = expander.expand(&pixels).unwrap();
+        assert_eq!(&rgba[0..4], &[128, 128, 128, 0]); // matches -> transparent
+        assert_eq!(&rgba[4..8], &[200, 200, 200, 255]); // no match -> opaque
+    }
+
+    #[test]
+    fn trns_makes_matching_truecolor_pixel_transparent() {
+        let ihdr = ihdr(2, 1, 8, ColorType::Truecolor);
+        let data = [0x00, 1, 0x00, 2, 0x00, 3]; // transparent color (1,2,3)
+        let trns = Transparency::parse(ColorType::Truecolor, &data).unwrap();
+        let expander = RgbaExpander::new(&ihdr, None, Some(&trns));
+        let pixels = [1u8, 2, 3, 9, 9, 9];
+        let rgba = expander.expand(&pixels).unwrap();
+        assert_eq!(&rgba[0..4], &[1, 2, 3, 0]);
+        assert_eq!(&rgba[4..8], &[9, 9, 9, 255]);
+    }
+
+    #[test]
+    fn trns_gives_indexed_color_per_entry_alpha() {
+        let ihdr = ihdr(3, 1, 8, ColorType::IndexedColor);
+        let palette = Palette::parse(&[10, 10, 10, 20, 20, 20, 30, 30, 30]).unwrap();
+        let trns = Transparency::parse(ColorType::IndexedColor, &[0, 128]).unwrap(); // index 2: default opaque
+        let expander = RgbaExpander::new(&ihdr, Some(&palette), Some(&trns));
+        let pixels = [0u8, 1, 2];
+        let rgba = expander.expand(&pixels).unwrap();
+        assert_eq!(&rgba[0..4], &[10, 10, 10, 0]);
+        assert_eq!(&rgba[4..8], &[20, 20, 20, 128]);
+        assert_eq!(&rgba[8..12], &[30, 30, 30, 255]); // past tRNS's end: opaque
     }
 }

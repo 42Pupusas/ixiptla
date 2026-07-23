@@ -2,26 +2,38 @@
 /// as specified by PNG's Annex D — every chunk's trailing 4 bytes are this
 /// CRC over the chunk's type + data.
 ///
-/// PNG's own spec ships a reference table-based implementation; this is
-/// that same algorithm, kept as its own struct rather than a free function
-/// so a chunk can be fed to it incrementally (type bytes, then data) without
-/// concatenating a temporary buffer first.
+/// PNG's own spec ships a reference table-based implementation processing
+/// one byte per table lookup; this instead uses the "slicing-by-8"
+/// technique (Intel's well-known CRC speedup: 8 precomputed tables, one
+/// per byte lane, so 8 input bytes are folded per loop iteration instead
+/// of 1) since a single `IDAT` chunk's CRC can cover a multi-megabyte
+/// compressed payload — the dominant per-chunk cost for any real image.
+/// Kept as its own struct rather than a free function so a chunk can be
+/// fed to it incrementally (type bytes, then data) without concatenating a
+/// temporary buffer first.
 #[derive(Debug, Clone)]
 pub struct Crc32 {
     state: u32,
 }
 
 impl Crc32 {
-    /// Precomputed table of CRC remainders for all 256 possible byte
-    /// values, built once at compile time (PNG Annex D's `make_crc_table`).
-    const TABLE: [u32; 256] = Self::build_table();
+    /// Precomputed tables of CRC remainders for all 256 possible byte
+    /// values at each of 8 byte lanes, built once at compile time.
+    /// `TABLES[0]` is PNG Annex D's ordinary `make_crc_table`; `TABLES[n]`
+    /// for `n > 0` is `TABLES[n-1]` run through the same shift-XOR step
+    /// again -- equivalently, `TABLES[n][b]` is the CRC contribution of
+    /// byte `b` sitting `n` positions back in the stream, which is what
+    /// lets 8 bytes be combined via 8 table lookups + XORs instead of 8
+    /// sequential single-byte folds.
+    const TABLES: [[u32; 256]; 8] = Self::build_tables();
 
     #[allow(clippy::cast_possible_truncation)]
-    const fn build_table() -> [u32; 256] {
-        let mut table = [0u32; 256];
+    const fn build_tables() -> [[u32; 256]; 8] {
+        let mut tables = [[0u32; 256]; 8];
+
+        // Lane 0 is the ordinary reference table.
         let mut n = 0;
         while n < 256 {
-            // n never exceeds 255 (loop bound), so this cast is exact.
             let mut c = n as u32;
             let mut k = 0;
             while k < 8 {
@@ -32,10 +44,27 @@ impl Crc32 {
                 };
                 k += 1;
             }
-            table[n] = c;
+            tables[0][n] = c;
             n += 1;
         }
-        table
+
+        // Each subsequent lane is derived from the previous one: folding
+        // a zero byte through the CRC step is exactly `table[c & 0xFF] ^
+        // (c >> 8)` with the low byte taken as an index -- iterating that
+        // gives the "this byte is one position further back" tables the
+        // slicing-by-8 combine step needs.
+        let mut lane = 1;
+        while lane < 8 {
+            let mut n = 0;
+            while n < 256 {
+                let prev = tables[lane - 1][n];
+                tables[lane][n] = tables[0][(prev & 0xFF) as usize] ^ (prev >> 8);
+                n += 1;
+            }
+            lane += 1;
+        }
+
+        tables
     }
 
     /// Start a new running CRC (PNG's `crc = 0xffffffff` initial state).
@@ -45,10 +74,37 @@ impl Crc32 {
     }
 
     /// Fold more bytes into the running CRC.
+    ///
+    /// Processes 8-byte chunks via the slicing-by-8 combine step, then
+    /// finishes any `< 8`-byte remainder with the plain single-byte table
+    /// lookup (lane 0) -- identical results to the byte-at-a-time
+    /// reference algorithm, just batched.
     pub fn update(&mut self, bytes: &[u8]) -> &mut Self {
         let mut c = self.state;
-        for &byte in bytes {
-            c = Self::TABLE[((c ^ u32::from(byte)) & 0xFF) as usize] ^ (c >> 8);
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            // Fold the running CRC's 4 bytes in as the first 4 input
+            // bytes of this block (standard slicing-by-8 combine), then
+            // look up each of the 8 block bytes in its own lane table and
+            // XOR them all together. Table indices run from the
+            // most-significant lane (byte 7, farthest back) down to the
+            // least (byte 0, most recent), matching `TABLES[n]`'s "n
+            // positions back" derivation above.
+            let c0 = (c & 0xFF) as u8 ^ chunk[0];
+            let c1 = ((c >> 8) & 0xFF) as u8 ^ chunk[1];
+            let c2 = ((c >> 16) & 0xFF) as u8 ^ chunk[2];
+            let c3 = ((c >> 24) & 0xFF) as u8 ^ chunk[3];
+            c = Self::TABLES[7][c0 as usize]
+                ^ Self::TABLES[6][c1 as usize]
+                ^ Self::TABLES[5][c2 as usize]
+                ^ Self::TABLES[4][c3 as usize]
+                ^ Self::TABLES[3][chunk[4] as usize]
+                ^ Self::TABLES[2][chunk[5] as usize]
+                ^ Self::TABLES[1][chunk[6] as usize]
+                ^ Self::TABLES[0][chunk[7] as usize];
+        }
+        for &byte in chunks.remainder() {
+            c = Self::TABLES[0][((c ^ u32::from(byte)) & 0xFF) as usize] ^ (c >> 8);
         }
         self.state = c;
         self
@@ -113,5 +169,42 @@ mod tests {
         data.push(0); // filter
         data.push(0); // interlace
         assert_eq!(Crc32::of(&data), 2_423_739_358);
+    }
+
+    /// Exercises the slicing-by-8 fast path plus its `< 8`-byte remainder
+    /// tail across a range of lengths straddling multiple 8-byte block
+    /// boundaries, cross-checked against the plain byte-at-a-time
+    /// algorithm (lane-0-only, the pre-slicing-by-8 implementation) on
+    /// the same deterministic pseudo-random input -- catches an off-by-
+    /// one in the chunking/remainder split that a single fixed-size test
+    /// vector wouldn't.
+    #[test]
+    fn slicing_by_8_matches_byte_at_a_time_across_lengths() {
+        fn byte_at_a_time(bytes: &[u8]) -> u32 {
+            let table = Crc32::build_tables()[0];
+            let mut c = 0xFFFF_FFFFu32;
+            for &byte in bytes {
+                c = table[((c ^ u32::from(byte)) & 0xFF) as usize] ^ (c >> 8);
+            }
+            c ^ 0xFFFF_FFFF
+        }
+
+        let mut state = 0x1234_5678u32;
+        let mut next_byte = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state & 0xFF) as u8
+        };
+        let data: Vec<u8> = (0..2000).map(|_| next_byte()).collect();
+
+        for len in [0, 1, 3, 7, 8, 9, 15, 16, 17, 63, 64, 65, 1000, 1999, 2000] {
+            let slice = &data[..len];
+            assert_eq!(
+                Crc32::of(slice),
+                byte_at_a_time(slice),
+                "mismatch at len {len}"
+            );
+        }
     }
 }

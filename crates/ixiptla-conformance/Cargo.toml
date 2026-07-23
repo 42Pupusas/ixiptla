@@ -1,0 +1,21 @@
+[package]
+name = "ixiptla-conformance"
+description = "Differential testing of ixiptla-core against the battle-tested `png` crate: same bytes in, same RGBA8 pixels out."
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+ixiptla-core.workspace = true
+png = "0.18"
+flate2 = "1"
+crc32fast = "1"

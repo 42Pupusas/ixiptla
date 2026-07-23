@@ -94,6 +94,27 @@ impl Png {
 
     /// Defilter a non-interlaced `IDAT` stream: one flat sequence of
     /// `1 + stride`-byte scanlines, top to bottom.
+    //
+    // Unfilters in place and then compacts the filter-type bytes out,
+    // rather than defiltering into `inflated` and `extend_from_slice`-ing
+    // each row's content into a second, freshly-allocated `pixels` buffer.
+    // The upstream `png` crate's own optimization notes (see their 2026
+    // "gets even faster" writeup) call this out as one of their largest
+    // wins for exactly the same reason it helps here: touching each byte
+    // once for defiltering and once again for the copy makes two passes
+    // over an image-sized buffer instead of one, and doubles the amount
+    // of data that has to round-trip through cache -- for a large image
+    // neither the filtered row nor the growing output vector fits in L1/L2
+    // at the same time, so the second pass is mostly-cold reads/writes,
+    // not something the CPU can hide.
+    //
+    // The compaction below is a `copy_within` shifting each row's content
+    // left by (however many filter-type bytes have been dropped so far),
+    // which -- because `write_offset <= read row start` always -- is
+    // exactly the same self-overlapping-but-safe backward-compatible
+    // shrink `Vec::dedup`-style algorithms use; `chunks_mut` still drives
+    // the defiltering itself unchanged; only what happens to the result
+    // differs.
     fn defilter_sequential(ihdr: &Ihdr, mut inflated: Vec<u8>) -> Result<Vec<u8>, DecodeError> {
         let row_len = 1 + ihdr.stride();
         if inflated.len() % row_len != 0 {
@@ -108,12 +129,33 @@ impl Png {
         }
 
         let mut defilter = Defilter::new(ihdr);
-        let mut pixels = Vec::with_capacity(ihdr.stride() * row_count);
-        for row in inflated.chunks_mut(row_len) {
+        let stride = ihdr.stride();
+        let mut write_offset = 0usize;
+        for read_offset in (0..inflated.len()).step_by(row_len) {
+            let row = &mut inflated[read_offset..read_offset + row_len];
             defilter.defilter_row(row)?;
-            pixels.extend_from_slice(&row[1..]);
+            // `row[1..]` (the defiltered content, skipping this row's
+            // filter-type byte) needs to end up at
+            // `inflated[write_offset..][..stride]`. `write_offset` only
+            // ever trails `read_offset + 1` (one filter-type byte has been
+            // dropped per row already processed, and this row's own byte
+            // makes it two once we account for the byte at `read_offset`
+            // itself), so the source and destination ranges never overlap
+            // in a way `copy_within` can't handle -- same shape as
+            // `Vec::dedup`'s in-place compaction.
+            inflated.copy_within(read_offset + 1..read_offset + row_len, write_offset);
+            write_offset += stride;
         }
-        Ok(pixels)
+        inflated.truncate(row_count * stride);
+        // `inflated`'s capacity was sized for the *filtered* stream
+        // (`row_count * row_len`, one byte per row larger than the
+        // defiltered content it now holds); `shrink_to_fit` releases that
+        // slack back to the allocator instead of carrying it in every
+        // `Png` this function returns for the rest of that `Png`'s
+        // lifetime -- worth an extra realloc+copy here since it's O(one
+        // row's worth of bytes) of overhead, not O(image size).
+        inflated.shrink_to_fit();
+        Ok(inflated)
     }
 
     /// Defilter and reassemble an `Adam7`-interlaced `IDAT` stream.

@@ -1,4 +1,7 @@
-use crate::simd::{WrappingByteAdder, WrappingLaneScan, WrappingPrefixSum};
+use crate::simd::{
+    WrappingAverageScan, WrappingByteAdder, WrappingLaneScan, WrappingPaethScan,
+    WrappingPrefixSum,
+};
 use crate::{FilterType, Ihdr, InvalidFilterType};
 
 /// Reverses PNG's per-scanline byte filtering (spec §9), turning the
@@ -135,17 +138,11 @@ impl Defilter {
         for (byte, &above) in content[..prefix_len].iter_mut().zip(&self.previous_row) {
             *byte = byte.wrapping_add(above / 2); // a == 0: floor(b/2).
         }
-        #[allow(clippy::needless_range_loop)]
-        for i in bpp..content.len() {
-            let a = content[i - bpp];
-            let b = self.previous_row[i];
-            // midpoint, but in a wider type: a + b can be up to 510, which
-            // doesn't fit in u8, before the floor-divide brings it back down.
-            let avg = u16::midpoint(u16::from(a), u16::from(b));
-            #[allow(clippy::cast_possible_truncation)]
-            let avg = avg as u8; // avg <= 255 always: (255+255)/2 = 255.
-            content[i] = content[i].wrapping_add(avg);
-        }
+        // Suffix (i >= bpp): delegated to WrappingAverageScan, which does
+        // the same pixel-at-a-time floor((a+b)/2) reconstruction but via
+        // one SSE2 pavgb (+ off-by-one floor correction) per whole pixel
+        // on x86_64, instead of a scalar u16-widened divide per byte.
+        WrappingAverageScan::scan_suffix(content, &self.previous_row, bpp);
     }
 
     /// `Recon(x) = Filt(x) + PaethPredictor(Recon(a), Recon(b), Recon(c))`.
@@ -166,32 +163,12 @@ impl Defilter {
         for (byte, &above) in content[..prefix_len].iter_mut().zip(&self.previous_row) {
             *byte = byte.wrapping_add(above);
         }
-        #[allow(clippy::needless_range_loop)]
-        for i in bpp..content.len() {
-            let a = content[i - bpp];
-            let b = self.previous_row[i];
-            let c = self.previous_row[i - bpp];
-            content[i] = content[i].wrapping_add(Self::paeth_predictor(a, b, c));
-        }
-    }
-
-    /// Spec §9.4's Paeth predictor: picks whichever of the left/above/
-    /// upper-left neighbor is closest to `a + b - c` (linear-gradient
-    /// prediction), with ties broken in the order left, above, upper-left.
-    fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
-        let (a, b, c) = (i32::from(a), i32::from(b), i32::from(c));
-        let p = a + b - c;
-        let pa = (p - a).abs();
-        let pb = (p - b).abs();
-        let pc = (p - c).abs();
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        if pa <= pb && pa <= pc {
-            a as u8
-        } else if pb <= pc {
-            b as u8
-        } else {
-            c as u8
-        }
+        // Suffix (i >= bpp): delegated to WrappingPaethScan, which computes
+        // one whole pixel's bpp-channel Paeth predictor per SSE2
+        // instruction batch (i16 lanes; no native u8 abs/select in
+        // baseline SSE2) on x86_64, instead of bpp scalar predictor calls
+        // per pixel.
+        WrappingPaethScan::scan_suffix(content, &self.previous_row, bpp);
     }
 }
 

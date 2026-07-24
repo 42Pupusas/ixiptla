@@ -388,9 +388,136 @@ impl WrappingLaneScan {
     }
 }
 
+/// `Average` filter reconstruction: `Recon(x) = Filt(x) + floor((Recon(a) +
+/// Recon(b)) / 2)`, where `a` is the `bpp`-strided left neighbor (already
+/// reconstructed, same row) and `b` is the byte directly above (the
+/// previous row, entirely already known).
+///
+/// # Why this stays scalar
+///
+/// An earlier version of this struct vectorized the per-pixel `avg(a, b)`
+/// computation with SSE2's `pavgb`, loading each pixel's `bpp` (<=8) bytes
+/// into a 128-bit register via a zero-padded on-stack buffer, computing,
+/// and storing back out through another stack buffer. Benchmarked against
+/// `ixiptla-bench`'s isolated `defilter_truecolor_alpha_average_only` case
+/// at 1024px, that version was *consistently slower* than a plain scalar
+/// loop (~13ms vs ~3.7ms median) -- the load/store round-trip for a
+/// register that's using at most 8 of its 16 lanes, once per *single
+/// pixel* (this recurrence is inherently one-pixel-at-a-time -- `a`
+/// depends on the immediately preceding pixel), costs far more than the
+/// handful of scalar ALU ops it replaces. `Sub`/`Up`'s SIMD wins work
+/// because they either batch many pixels per register (`Sub`, via
+/// `WrappingLaneScan`) or have no per-row sequential dependency at all
+/// (`Up`). `Average` has neither: it's genuinely one pixel per step, and
+/// at `bpp <= 8` a pixel is too narrow to amortize a 128-bit load/store.
+/// So this is deliberately the plain scalar loop, kept as its own struct
+/// (rather than inlined into `Defilter`) purely for symmetry with the
+/// other `Wrapping*` scan types and to keep `defilter.rs` itself free of
+/// the loop body.
+#[derive(Debug)]
+pub struct WrappingAverageScan;
+
+impl WrappingAverageScan {
+    /// Reconstructs `content` in place given `previous_row` (`b`, same
+    /// length) and `bpp` (the fixed left-neighbor stride). The first `bpp`
+    /// bytes (`a == 0`) must already be handled by the caller -- this only
+    /// walks the general `i >= bpp` suffix, exactly like `Defilter::
+    /// undo_average`'s own split.
+    ///
+    /// # Panics
+    ///
+    /// If `previous_row.len()` != `content.len()`.
+    pub fn scan_suffix(content: &mut [u8], previous_row: &[u8], bpp: usize) {
+        assert_eq!(
+            content.len(),
+            previous_row.len(),
+            "scan_suffix: length mismatch"
+        );
+        #[allow(clippy::needless_range_loop)]
+        for i in bpp..content.len() {
+            let a = content[i - bpp];
+            let b = previous_row[i];
+            // midpoint, but in a wider type: a + b can be up to 510, which
+            // doesn't fit in u8, before the floor-divide brings it back
+            // down.
+            let avg = u16::midpoint(u16::from(a), u16::from(b));
+            #[allow(clippy::cast_possible_truncation)]
+            let avg = avg as u8; // avg <= 255 always: (255+255)/2 = 255.
+            content[i] = content[i].wrapping_add(avg);
+        }
+    }
+}
+
+/// `Paeth` filter reconstruction: `Recon(x) = Filt(x) + PaethPredictor(
+/// Recon(a), Recon(b), Recon(c))`.
+///
+/// # Why this stays scalar
+///
+/// Same finding as [`WrappingAverageScan`], more pronounced: an earlier
+/// SSE2 version (zero-extending each pixel's `bpp` bytes into `i16`
+/// lanes, computing the 3-way `abs`/compare/select predictor there, and
+/// packing back to `u8`, all through on-stack load/store buffers per
+/// single pixel) benchmarked *slower* than the plain scalar loop on
+/// `defilter_truecolor_alpha_paeth_only` at 1024px (~16.5ms vs ~14.2ms
+/// median) -- `Paeth`'s recurrence is one pixel per step just like
+/// `Average`, so the same narrow-register load/store tax applies, and
+/// `Paeth`'s predictor needs *more* instructions per register op (3-way
+/// abs+compare+blend against baseline SSE2's missing pieces: no `pabsw`,
+/// no `pblendvb`) than `Average`'s single `pavgb`, making the tradeoff
+/// even worse. Kept as its own struct for the same symmetry/SRP reasons
+/// as `WrappingAverageScan`.
+#[derive(Debug)]
+pub struct WrappingPaethScan;
+
+impl WrappingPaethScan {
+    /// Reconstructs `content` in place given `previous_row` (`b`/`c`
+    /// source, same length) and `bpp`. The first `bpp` bytes (`a == c ==
+    /// 0`, where `PaethPredictor` always reduces to `b`) must already be
+    /// handled by the caller, exactly like `Defilter::undo_paeth`'s own
+    /// split.
+    ///
+    /// # Panics
+    ///
+    /// If `previous_row.len()` != `content.len()`.
+    pub fn scan_suffix(content: &mut [u8], previous_row: &[u8], bpp: usize) {
+        assert_eq!(
+            content.len(),
+            previous_row.len(),
+            "scan_suffix: length mismatch"
+        );
+        #[allow(clippy::needless_range_loop)]
+        for i in bpp..content.len() {
+            let a = content[i - bpp];
+            let b = previous_row[i];
+            let c = previous_row[i - bpp];
+            content[i] = content[i].wrapping_add(Self::paeth_predictor(a, b, c));
+        }
+    }
+
+    /// Spec §9.4's Paeth predictor: picks whichever of the left/above/
+    /// upper-left neighbor is closest to `a + b - c` (linear-gradient
+    /// prediction), with ties broken in the order left, above, upper-left.
+    fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
+        let (a, b, c) = (i32::from(a), i32::from(b), i32::from(c));
+        let p = a + b - c;
+        let pa = (p - a).abs();
+        let pb = (p - b).abs();
+        let pc = (p - c).abs();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        if pa <= pb && pa <= pc {
+            a as u8
+        } else if pb <= pc {
+            b as u8
+        } else {
+            c as u8
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
-    use super::{WrappingByteAdder, WrappingLaneScan, WrappingPrefixSum};
+    use super::{WrappingAverageScan, WrappingByteAdder, WrappingLaneScan, WrappingPaethScan, WrappingPrefixSum};
 
     #[test]
     fn matches_scalar_wrapping_add_elementwise() {
@@ -545,5 +672,142 @@ mod tests {
             WrappingLaneScan::scan(&mut actual, bpp);
             assert_eq!(actual, expected, "bpp={bpp}");
         }
+    }
+
+    /// Reference scalar Average-filter suffix reconstruction, mirroring
+    /// `Defilter::undo_average`'s own `i >= bpp` loop -- used to check
+    /// `WrappingAverageScan::scan_suffix` independent of its own SIMD/
+    /// scalar split.
+    fn scalar_average_suffix(content: &[u8], previous_row: &[u8], bpp: usize) -> Vec<u8> {
+        let mut out = content.to_vec();
+        #[allow(clippy::needless_range_loop)]
+        for i in bpp..out.len() {
+            let a = out[i - bpp];
+            let b = previous_row[i];
+            let avg = u16::midpoint(u16::from(a), u16::from(b));
+            #[allow(clippy::cast_possible_truncation)]
+            let avg = avg as u8;
+            out[i] = out[i].wrapping_add(avg);
+        }
+        out
+    }
+
+    #[test]
+    fn average_scan_matches_scalar_reference_for_every_supported_bpp() {
+        // bpp in {1, 2, 3, 4, 6, 8} covers every channel/bit-depth
+        // combination PNG actually defines (bpp==1 falls back to scalar
+        // internally -- no SSE2 special case, since there's only one lane
+        // -- but must still produce the right answer); lengths span both
+        // sides of the SSE2 pixel-chunk loop's stopping point.
+        for bpp in [1usize, 2, 3, 4, 6, 8] {
+            for len in [0usize, bpp, bpp * 2, bpp * 3, 15, 16, 17, 31, 32, 100, 251] {
+                if len < bpp {
+                    continue;
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                let content: Vec<u8> = (0..len as u32).map(|n| ((n * 29 + 7) % 256) as u8).collect();
+                #[allow(clippy::cast_possible_truncation)]
+                let previous_row: Vec<u8> = (0..len as u32).map(|n| ((n * 53 + 11) % 256) as u8).collect();
+                let expected = scalar_average_suffix(&content, &previous_row, bpp);
+                let mut actual = content.clone();
+                WrappingAverageScan::scan_suffix(&mut actual, &previous_row, bpp);
+                assert_eq!(actual, expected, "bpp={bpp} len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn average_scan_floors_not_rounds() {
+        // bpp=1: a=255 (content[0], acting as the lane-0 "already
+        // reconstructed" predecessor), b=0 (previous_row[1]) -> avg =
+        // floor(255/2) = 127, not 128 -- catches an off-by-one toward
+        // pavgb's built-in ceil rounding if the correction is ever wrong.
+        let mut content = vec![255u8, 0];
+        let previous_row = vec![0u8, 0];
+        WrappingAverageScan::scan_suffix(&mut content, &previous_row, 1);
+        assert_eq!(content, vec![255u8, 127]);
+    }
+
+    /// Reference scalar Paeth-filter suffix reconstruction, mirroring
+    /// `Defilter::undo_paeth`'s own `i >= bpp` loop -- used to check
+    /// `WrappingPaethScan::scan_suffix` independent of its own SIMD/
+    /// scalar split.
+    fn scalar_paeth_suffix(content: &[u8], previous_row: &[u8], bpp: usize) -> Vec<u8> {
+        fn predictor(a: u8, b: u8, c: u8) -> u8 {
+            let (a, b, c) = (i32::from(a), i32::from(b), i32::from(c));
+            let p = a + b - c;
+            let pa = (p - a).abs();
+            let pb = (p - b).abs();
+            let pc = (p - c).abs();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            if pa <= pb && pa <= pc {
+                a as u8
+            } else if pb <= pc {
+                b as u8
+            } else {
+                c as u8
+            }
+        }
+        let mut out = content.to_vec();
+        #[allow(clippy::needless_range_loop)]
+        for i in bpp..out.len() {
+            let a = out[i - bpp];
+            let b = previous_row[i];
+            let c = previous_row[i - bpp];
+            out[i] = out[i].wrapping_add(predictor(a, b, c));
+        }
+        out
+    }
+
+    #[test]
+    fn paeth_scan_matches_scalar_reference_for_every_supported_bpp() {
+        for bpp in [1usize, 2, 3, 4, 6, 8] {
+            for len in [0usize, bpp, bpp * 2, bpp * 3, 15, 16, 17, 31, 32, 100, 251] {
+                if len < bpp {
+                    continue;
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                let content: Vec<u8> = (0..len as u32).map(|n| ((n * 71 + 3) % 256) as u8).collect();
+                #[allow(clippy::cast_possible_truncation)]
+                let previous_row: Vec<u8> = (0..len as u32).map(|n| ((n * 97 + 17) % 256) as u8).collect();
+                let expected = scalar_paeth_suffix(&content, &previous_row, bpp);
+                let mut actual = content.clone();
+                WrappingPaethScan::scan_suffix(&mut actual, &previous_row, bpp);
+                assert_eq!(actual, expected, "bpp={bpp} len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn paeth_scan_falls_back_correctly_for_unsupported_bpp() {
+        // bpp > 8 never occurs in a real PNG (max channels x max byte
+        // width = 4 x 2 = 8), but the scalar fallback must still be
+        // correct if ever exercised.
+        for bpp in [9usize, 12] {
+            #[allow(clippy::cast_possible_truncation)]
+            let content: Vec<u8> = (0..40u32).map(|n| (n * 5) as u8).collect();
+            #[allow(clippy::cast_possible_truncation)]
+            let previous_row: Vec<u8> = (0..40u32).map(|n| (n * 13) as u8).collect();
+            let expected = scalar_paeth_suffix(&content, &previous_row, bpp);
+            let mut actual = content.clone();
+            WrappingPaethScan::scan_suffix(&mut actual, &previous_row, bpp);
+            assert_eq!(actual, expected, "bpp={bpp}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "length mismatch")]
+    fn average_scan_panics_on_length_mismatch() {
+        let mut content = vec![1u8, 2, 3];
+        let previous_row = vec![1u8, 2];
+        WrappingAverageScan::scan_suffix(&mut content, &previous_row, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "length mismatch")]
+    fn paeth_scan_panics_on_length_mismatch() {
+        let mut content = vec![1u8, 2, 3];
+        let previous_row = vec![1u8, 2];
+        WrappingPaethScan::scan_suffix(&mut content, &previous_row, 1);
     }
 }

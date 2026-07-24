@@ -61,6 +61,23 @@ impl Defilter {
     /// well-formed `IDAT` stream, whose stride is always >= 0 content
     /// bytes plus exactly one filter-type byte) is treated as `FilterType::
     /// None` over zero content bytes, i.e. a harmless no-op.
+    //
+    // `#[inline]`: this function's body -- a `split_first_mut`, a 5-way
+    // `match`, and a call into one of the `undo_*` dispatchers -- looks
+    // trivial, but it contains loops inside those `undo_*` calls (thin-LTO
+    // sees this whole module during optimization, but LLVM's default
+    // "is this worth inlining" heuristic still weighs a function's own
+    // apparent size, not what it eventually calls into). Measured via
+    // `ixiptla-bench`'s isolated `defilter_*` benchmarks (no encode/CRC/
+    // adler32 noise, unlike the full end-to-end `decode_loop` `perf`
+    // profile this was originally spotted in): adding this one hint
+    // dropped `defilter_truecolor_alpha`'s median at 1024px from ~1.02ms
+    // to ~0.94ms (~7% faster), with `up_only` (the cheapest, most call-
+    // overhead-dominated case) improving the most at ~20% -- consistent
+    // with the win being "this call used to actually happen" rather than
+    // measurement noise, since a pure call-overhead removal should matter
+    // proportionally *more* the cheaper the callee's own work is, which
+    // is exactly the pattern observed across every filter type.
     pub fn defilter_row(
         &self,
         row: &mut [u8],

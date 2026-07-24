@@ -572,11 +572,47 @@ impl WrappingAverageScan {
 /// `b`, `c` all move directly between a GPR and an XMM register's low 32
 /// bits (`_mm_cvtsi32_si128`/`_mm_cvtsi128_si32`, via
 /// [`WrappingAverageScan::load_pixel`]/`store_pixel`, reused here) with no
-/// stack buffer, then get zero-extended to `i16` lanes (`bpp <= 4` bytes
-/// always fit in the low 4 of a register's 8 `i16` lanes) so the
-/// predictor's subtraction/abs/compare can't overflow `i8`. `b` and `c`
-/// carry forward as registers across iterations exactly like `a` does in
-/// `WrappingAverageScan` -- `c` is simply last iteration's `b`.
+/// stack buffer.
+///
+/// The predictor algebra itself is Google's fpnge PNG encoder's own SIMD
+/// Paeth reconstruction (`fpnge.cc`'s `PredictVec<4>`, adapted here from
+/// filtering to defiltering -- same predictor, just added instead of
+/// subtracted). Unlike the classic `p = a + b - c` / `abs` / 3-way
+/// compare, which needs signed headroom beyond `u8` (hence the `i16`
+/// widen this module used to do), it stays in `u8` the whole way
+/// through, by first collapsing `a`/`b` down to `lo = min(a, b)` and
+/// `hi = max(a, b)`:
+///
+/// ```text
+/// lo = min(a, b); hi = max(a, b)
+/// pa = hi -| c        (saturating: max(0, hi - c))
+/// pb = c -| lo         (saturating: max(0, c - lo))
+/// pc = max(pa, pb) - min(pa, pb)   (= |pa - pb|; plain sub is exact
+///                                    here since max >= min always)
+/// pick lo  if pa is the smallest of {pa, pb, pc}
+/// pick hi  else if pb is the smallest
+/// pick c   otherwise
+/// ```
+///
+/// Correctness (byte-for-byte identical to the spec's predictor across
+/// every input, ties included) is exercised by this module's own
+/// `paeth_scan_matches_scalar_reference_for_every_supported_bpp` test,
+/// which sweeps every supported `bpp` against
+/// [`Self::paeth_predictor`]'s spec-literal scalar formulation -- this
+/// matters more than usual here since the `lo`/`hi` reformulation below
+/// is decidedly non-obvious to hand-verify by algebra alone (fpnge's own
+/// paper derives it, but taking that on faith without a byte-exhaustive
+/// check would be reckless for a decoder that must reproduce whatever
+/// tie an *encoder's* own Paeth predictor happened to make). Every
+/// step -- `min`/`max`/saturating-sub/`cmpeq`/select -- is a single
+/// baseline-SSE2 instruction (`pminub`/`pmaxub`/`psubusb`/`pcmpeqb`,
+/// select done as the classic `(mask & t) | (!mask & e)` bitmask trick
+/// since `pcmpeqb`'s all-1s/all-0s output is already a valid bitmask),
+/// with no `i16` widen/narrow round-trip at all. That means -- unlike
+/// this module's `Up`/`Average` paths, which stick to plain SSE2 by
+/// choice -- there's no SSSE3/SSE4.1 tier to reach for here: this
+/// formulation already *is* the fast path, unconditionally, on every
+/// `x86_64` CPU.
 #[derive(Debug)]
 pub struct WrappingPaethScan;
 
@@ -598,28 +634,12 @@ impl WrappingPaethScan {
         );
         #[cfg(target_arch = "x86_64")]
         {
-            // SSSE3's `pabsw` and SSE4.1's `pblendvb` turn this loop's
-            // abs/select steps -- baseline-SSE2-emulated multi-instruction
-            // sequences in `scan_suffix_sse2` below -- into single
-            // instructions each, shortening the one-pixel-at-a-time
-            // dependency chain this recurrence is inherently stuck with.
-            // Both extensions have shipped on essentially every x86_64
-            // CPU sold since ~2008 (Nehalem for SSE4.1, its Penryn
-            // predecessor for SSSE3), but unlike SSE2 neither is part of
-            // the `x86_64` baseline ABI, so this -- unlike the SSE2 paths
-            // elsewhere in this module -- needs a real runtime check
-            // (`is_x86_feature_detected!`), same pattern
-            // `crc32_pclmulqdq.rs` uses for PCLMULQDQ. Declining falls
-            // through to the SSE2 path below, never to plain scalar, so
-            // every CPU still gets *some* SIMD speedup for `bpp` 3/4.
-            let accelerated = match bpp {
-                3 => Self::try_scan_suffix_ssse3_sse41::<3>(content, previous_row),
-                4 => Self::try_scan_suffix_ssse3_sse41::<4>(content, previous_row),
-                _ => None,
-            };
-            if accelerated.is_some() {
-                return;
-            }
+            // Unlike this module's other SIMD paths, the fpnge Paeth
+            // algebra ([`Self::scan_suffix_sse2`]) is already the fast
+            // path on baseline SSE2 -- min/max/saturating-sub/cmpeq are
+            // all real single instructions there -- so there's no
+            // SSSE3/SSE4.1 tier to reach for, and hence no
+            // `is_x86_feature_detected!` runtime check needed at all.
             match bpp {
                 3 => return Self::scan_suffix_sse2::<3>(content, previous_row),
                 4 => return Self::scan_suffix_sse2::<4>(content, previous_row),
@@ -627,27 +647,6 @@ impl WrappingPaethScan {
             }
         }
         Self::scan_suffix_scalar(content, previous_row, bpp);
-    }
-
-    /// Attempts the SSSE3+SSE4.1-accelerated variant of
-    /// [`Self::scan_suffix_sse2`]; `None` means "declined, caller should
-    /// fall back" (missing CPU features), never "ran but failed" -- there
-    /// is no failure mode once dispatched, only a yes/no on whether to
-    /// dispatch at all.
-    #[cfg(target_arch = "x86_64")]
-    fn try_scan_suffix_ssse3_sse41<const BPP: usize>(
-        content: &mut [u8],
-        previous_row: &[u8],
-    ) -> Option<()> {
-        if !std::arch::is_x86_feature_detected!("ssse3")
-            || !std::arch::is_x86_feature_detected!("sse4.1")
-        {
-            return None;
-        }
-        // SAFETY: both feature checks above just confirmed the running
-        // CPU supports every intrinsic `scan_suffix_ssse3_sse41` uses.
-        unsafe { Self::scan_suffix_ssse3_sse41::<BPP>(content, previous_row) };
-        Some(())
     }
 
     fn scan_suffix_scalar(content: &mut [u8], previous_row: &[u8], bpp: usize) {
@@ -660,78 +659,14 @@ impl WrappingPaethScan {
         }
     }
 
-    /// Same structure as [`Self::scan_suffix_sse2`] (register-carried
-    /// `a`/`c`, i16-lane predictor algebra, `packus` narrowing at the
-    /// end), but the abs/select steps are single real instructions
-    /// (`pabsw`/`pblendvb`) instead of `scan_suffix_sse2`'s baseline-SSE2
-    /// multi-instruction emulation of both.
-    ///
-    /// # Safety
-    ///
-    /// Caller must have already confirmed `ssse3` and `sse4.1` are
-    /// available (see [`Self::try_scan_suffix_ssse3_sse41`]).
-    #[allow(clippy::many_single_char_names)]
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "ssse3", enable = "sse4.1")]
-    unsafe fn scan_suffix_ssse3_sse41<const BPP: usize>(content: &mut [u8], previous_row: &[u8]) {
-        use std::arch::x86_64::{
-            _mm_abs_epi16, _mm_add_epi8, _mm_add_epi16, _mm_blendv_epi8, _mm_cmpeq_epi16,
-            _mm_min_epi16, _mm_packus_epi16, _mm_setzero_si128, _mm_sub_epi16, _mm_unpacklo_epi8,
-        };
-
-        let zero = _mm_setzero_si128();
-        let widen = |v| _mm_unpacklo_epi8(v, zero);
-
-        let mut a = widen(WrappingAverageScan::load_pixel::<BPP>(&content[..BPP]));
-        let mut c = widen(WrappingAverageScan::load_pixel::<BPP>(&previous_row[..BPP]));
-
-        let mut i = BPP;
-        while i + BPP <= content.len() {
-            let b = widen(WrappingAverageScan::load_pixel::<BPP>(
-                &previous_row[i..i + BPP],
-            ));
-            let d = WrappingAverageScan::load_pixel::<BPP>(&content[i..i + BPP]);
-
-            // Same difference-of-differences algebra as `scan_suffix_sse2`
-            // (never materializes p = a+b-c itself), just with `pabsw`
-            // for the abs and `pblendvb` for the select instead of the
-            // hand-rolled equivalents: `pcmpeqw`'s all-1s/all-0s lanes
-            // are already a valid `pblendvb` mask (it reads each byte's
-            // high bit, and an all-1s 16-bit lane has its high bit set in
-            // both halves), so the comparison masks carry over unchanged.
-            let pa = _mm_abs_epi16(_mm_sub_epi16(b, c));
-            let pb = _mm_abs_epi16(_mm_sub_epi16(a, c));
-            let pc = _mm_abs_epi16(_mm_add_epi16(_mm_sub_epi16(b, c), _mm_sub_epi16(a, c)));
-            let smallest = _mm_min_epi16(pc, _mm_min_epi16(pa, pb));
-            let use_a = _mm_cmpeq_epi16(smallest, pa);
-            let use_b = _mm_cmpeq_epi16(smallest, pb);
-            let b_or_c = _mm_blendv_epi8(c, b, use_b);
-            let nearest = _mm_blendv_epi8(b_or_c, a, use_a);
-
-            let recon = _mm_add_epi8(d, _mm_packus_epi16(nearest, nearest));
-            WrappingAverageScan::store_pixel::<BPP>(&mut content[i..i + BPP], recon);
-
-            a = widen(recon);
-            c = b;
-            i += BPP;
-        }
-
-        let _ = (a, c);
-        for j in i..content.len() {
-            let a_byte = content[j - BPP];
-            let b_byte = previous_row[j];
-            let c_byte = previous_row[j - BPP];
-            content[j] = content[j].wrapping_add(Self::paeth_predictor(a_byte, b_byte, c_byte));
-        }
-    }
-
-    /// libpng-style register-carrying SSE2 loop for `BPP` in `{3, 4}`,
-    /// mirroring [`WrappingAverageScan::scan_suffix_sse2`]'s structure.
-    /// Works in zero-extended `i16` lanes throughout (`_mm_sub_epi16`/
-    /// `abs`/`_mm_min_epi16`/compare all need signed headroom the raw
-    /// `u8` values don't have -- `p - a` etc. can be negative or exceed
-    /// `i8::MAX`), then narrows back to `u8` via `_mm_packus_epi16` only
-    /// at the very end, right before storing.
+    /// fpnge-formula Paeth reconstruction for `BPP` in `{3, 4}`, register-
+    /// carrying `a`/`c` across pixels exactly like the SSE2 paths
+    /// elsewhere in this module (`c` is simply last iteration's `b`), but
+    /// -- unlike the `i16`-widening version this replaced -- every step
+    /// stays in raw `u8` lanes: no `_mm_unpacklo_epi8` widen going in, no
+    /// `_mm_packus_epi16` narrow coming out, just `pminub`/`pmaxub`/
+    /// `psubusb`/`psubb`/`pcmpeqb`/bitmask-select/`paddb`. See this
+    /// struct's doc comment for the algebra.
     // Single-letter names (a/b/c/d) deliberately mirror the PNG spec's own
     // Paeth notation (spec 9.4's a/b/c/x/d neighbor naming) rather than
     // more verbose alternatives -- keeping the code's variable names
@@ -741,63 +676,46 @@ impl WrappingPaethScan {
     #[cfg(target_arch = "x86_64")]
     fn scan_suffix_sse2<const BPP: usize>(content: &mut [u8], previous_row: &[u8]) {
         use std::arch::x86_64::{
-            _mm_add_epi8, _mm_cmpeq_epi16, _mm_min_epi16, _mm_packus_epi16, _mm_setzero_si128,
-            _mm_sub_epi16, _mm_unpacklo_epi8,
+            _mm_add_epi8, _mm_cmpeq_epi8, _mm_max_epu8, _mm_min_epu8, _mm_sub_epi8, _mm_subs_epu8,
         };
-
-        let zero = unsafe { _mm_setzero_si128() };
-        // Widen a packed-pixel __m128i (low BPP bytes meaningful, rest
-        // zero) to i16 lanes -- needed before any subtraction/abs/compare
-        // below, since those can go negative or exceed i8::MAX/u8::MAX.
-        let widen = |v| unsafe { _mm_unpacklo_epi8(v, zero) };
 
         // First iteration's a/c are both the all-zero "no left neighbor,
         // no upper-left neighbor" case (the caller's prefix loop already
         // handled bpp..content.len()'s i==bpp..2*bpp boundary condition
         // for us by writing content[..BPP] as plain `+= above`, so this
         // starts from content[BPP..] with a real `a`).
-        let mut a = widen(WrappingAverageScan::load_pixel::<BPP>(&content[..BPP]));
-        let mut c = widen(WrappingAverageScan::load_pixel::<BPP>(&previous_row[..BPP]));
+        let mut a = WrappingAverageScan::load_pixel::<BPP>(&content[..BPP]);
+        let mut c = WrappingAverageScan::load_pixel::<BPP>(&previous_row[..BPP]);
 
         let mut i = BPP;
         while i + BPP <= content.len() {
-            let b = widen(WrappingAverageScan::load_pixel::<BPP>(
-                &previous_row[i..i + BPP],
-            ));
+            let b = WrappingAverageScan::load_pixel::<BPP>(&previous_row[i..i + BPP]);
             let d = WrappingAverageScan::load_pixel::<BPP>(&content[i..i + BPP]);
 
-            // Paeth predictor algebra, entirely in terms of differences
-            // (avoids ever materializing p = a+b-c itself, same
-            // simplification libpng's C uses):
-            //   p - a == b - c
-            //   p - b == a - c
-            //   p - c == (b-c) + (a-c)
-            let (nearest, pa, pb, pc) = unsafe {
-                let pa = _mm_sub_epi16(b, c);
-                let pb = _mm_sub_epi16(a, c);
-                let pc = Self::add_epi16(pa, pb);
-                let (pa, pb, pc) = (
-                    Self::abs_epi16(pa),
-                    Self::abs_epi16(pb),
-                    Self::abs_epi16(pc),
-                );
-                let smallest = _mm_min_epi16(pc, _mm_min_epi16(pa, pb));
-                // Ties favour a, then b, then c -- matches the scalar
-                // predictor's `pa <= pb && pa <= pc` / `pb <= pc` order.
-                let use_a = _mm_cmpeq_epi16(smallest, pa);
-                let use_b = _mm_cmpeq_epi16(smallest, pb);
-                let b_or_c = Self::select_epi16(use_b, b, c);
-                (Self::select_epi16(use_a, a, b_or_c), pa, pb, pc)
+            // fpnge's reformulation of the Paeth predictor (see this
+            // struct's doc comment): stays entirely in unsigned `u8`
+            // lanes, no signed intermediate ever needed.
+            let recon = unsafe {
+                let lo = _mm_min_epu8(a, b);
+                let hi = _mm_max_epu8(a, b);
+                let pa = _mm_subs_epu8(hi, c); // max(0, hi - c)
+                let pb = _mm_subs_epu8(c, lo); // max(0, c - lo)
+                let min_pab = _mm_min_epu8(pa, pb);
+                let max_pab = _mm_max_epu8(pa, pb);
+                let pc = _mm_sub_epi8(max_pab, min_pab); // = |pa - pb|, already >= 0
+                let min_pabc = _mm_min_epu8(min_pab, pc);
+                let use_lo = _mm_cmpeq_epi8(min_pabc, pa);
+                let use_hi = _mm_cmpeq_epi8(min_pabc, pb);
+                let hi_or_c = Self::select_bytes(use_hi, hi, c);
+                let pred = Self::select_bytes(use_lo, lo, hi_or_c);
+                _mm_add_epi8(d, pred)
             };
-            let _ = (pa, pb, pc); // consumed above; named only for the doc comment's algebra trail.
-
-            let recon = unsafe { _mm_add_epi8(d, _mm_packus_epi16(nearest, nearest)) };
             WrappingAverageScan::store_pixel::<BPP>(&mut content[i..i + BPP], recon);
 
             // Next iteration's a/c are this iteration's reconstructed
             // pixel / this iteration's b -- carried as registers, no
             // re-read from memory.
-            a = widen(recon);
+            a = recon;
             c = b;
             i += BPP;
         }
@@ -819,37 +737,12 @@ impl WrappingPaethScan {
         }
     }
 
-    /// `_mm_add_epi16` by another name -- broken out only so the doc
-    /// comment above can narrate `pc`'s derivation as a named step.
+    /// Bytewise `mask ? t : e`, for a `mask` that's already an all-1s/
+    /// all-0s comparison result (as `_mm_cmpeq_epi8` produces). Baseline
+    /// SSE2 has no `pblendvb` (that's SSE4.1), so this is the classic
+    /// bitmask blend: `(mask & t) | (!mask & e)`.
     #[cfg(target_arch = "x86_64")]
-    unsafe fn add_epi16(
-        x: std::arch::x86_64::__m128i,
-        y: std::arch::x86_64::__m128i,
-    ) -> std::arch::x86_64::__m128i {
-        unsafe { std::arch::x86_64::_mm_add_epi16(x, y) }
-    }
-
-    /// `|x|` for `i16` lanes. Baseline SSE2 has no `pabsw` (that's SSSE3),
-    /// so this is the two's-complement identity `x < 0 ? -x : x`: XOR
-    /// every negative lane's bits (flips them, i.e. one's-complement
-    /// negation), then add 1 to just the lanes that were negative --
-    /// exactly libpng's own `abs_i16` SSE2 fallback.
-    #[cfg(target_arch = "x86_64")]
-    unsafe fn abs_epi16(x: std::arch::x86_64::__m128i) -> std::arch::x86_64::__m128i {
-        use std::arch::x86_64::{_mm_cmplt_epi16, _mm_setzero_si128, _mm_sub_epi16, _mm_xor_si128};
-        unsafe {
-            let is_negative = _mm_cmplt_epi16(x, _mm_setzero_si128());
-            let flipped = _mm_xor_si128(x, is_negative);
-            _mm_sub_epi16(flipped, is_negative)
-        }
-    }
-
-    /// Bytewise/lanewise `mask ? t : e`, for a `mask` that's already an
-    /// all-1s/all-0s comparison result (as `_mm_cmpeq_epi16` produces).
-    /// Baseline SSE2 has no `pblendvb` (that's SSE4.1), so this is the
-    /// classic bitmask blend: `(mask & t) | (!mask & e)`.
-    #[cfg(target_arch = "x86_64")]
-    unsafe fn select_epi16(
+    unsafe fn select_bytes(
         mask: std::arch::x86_64::__m128i,
         t: std::arch::x86_64::__m128i,
         e: std::arch::x86_64::__m128i,

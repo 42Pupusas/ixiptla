@@ -50,7 +50,14 @@ fn ixiptla_truecolor_alpha(bencher: Bencher, side: u32) {
             decoded.palette.as_ref(),
             decoded.transparency.as_ref(),
         );
-        expander.expand(&decoded.pixels).unwrap()
+        // `expand_owned`, not `expand(&decoded.pixels)`: `decoded.pixels`
+        // isn't used again after this call, so this benchmark should time
+        // the same call shape a real caller would use -- letting the
+        // 8-bit TruecolorAlpha fast path skip its otherwise-redundant
+        // full-image copy (see `RgbaExpander::expand_owned`'s doc
+        // comment) rather than measuring a copy no real caller need pay
+        // for.
+        expander.expand_owned(decoded.pixels).unwrap()
     });
 }
 

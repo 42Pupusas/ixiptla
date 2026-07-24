@@ -26,8 +26,14 @@ impl ReferenceComparison {
             decoded.palette.as_ref(),
             decoded.transparency.as_ref(),
         );
+        // `expand_owned` instead of `expand(&decoded.pixels)`: this
+        // function discards `decoded.pixels` immediately after this call
+        // anyway (it isn't used again below), so handing over ownership
+        // lets the 8-bit TruecolorAlpha fast path skip a redundant
+        // full-image copy -- see `RgbaExpander::expand_owned`'s doc
+        // comment.
         expander
-            .expand(&decoded.pixels)
+            .expand_owned(decoded.pixels)
             .map_err(|e| format!("ixiptla_core expand: {e}"))
     }
 

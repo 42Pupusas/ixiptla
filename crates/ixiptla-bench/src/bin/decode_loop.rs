@@ -81,7 +81,12 @@ impl DecodeLoop {
         for _ in 0..self.iterations {
             let decoded = Png::decode(black_box(&self.file), 1 << 24).expect("fixture decodes");
             let expander = RgbaExpander::new(&decoded.ihdr, None, None);
-            let rgba = expander.expand(&decoded.pixels).expect("expand succeeds");
+            // `expand_owned`: matches the call shape a real caller
+            // (nothing else needs `decoded.pixels` after this) would use
+            // -- see `RgbaExpander::expand_owned`'s doc comment.
+            let rgba = expander
+                .expand_owned(decoded.pixels)
+                .expect("expand succeeds");
             black_box(rgba);
         }
         start.elapsed()

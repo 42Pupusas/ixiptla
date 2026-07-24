@@ -78,6 +78,9 @@ impl<'a> RgbaExpander<'a> {
         if self.ihdr.color_type == ColorType::TruecolorAlpha && self.ihdr.bit_depth == 8 {
             return Ok(pixels[..width * height * 4].to_vec());
         }
+        // (See `expand_owned` for a variant of this same fast path that
+        // avoids this `to_vec()` copy entirely when the caller already
+        // owns `pixels` outright.)
 
         // 8-bit Grayscale has no true zero-copy path the way 8-bit
         // TruecolorAlpha does above -- the source is 1 byte/pixel and the
@@ -111,6 +114,60 @@ impl<'a> RgbaExpander<'a> {
             }
         }
         Ok(out)
+    }
+
+    /// Like `expand`, but takes ownership of `pixels` (typically straight
+    /// off `crate::Png::decode`'s `pixels` field, which every real caller
+    /// -- `ixiptla-conformance`'s reference decoder, this crate's own
+    /// benchmarks -- discards immediately after the `expand` call anyway)
+    /// instead of borrowing it.
+    ///
+    /// This exists purely to close a gap `expand`'s own 8-bit
+    /// `TruecolorAlpha` fast path can't: when the caller only has a
+    /// `&[u8]` borrow, the only legal way to hand back an owned `Vec<u8>`
+    /// of those same bytes is a real `to_vec()` copy (a second full-image
+    /// memcpy, on top of whichever pass already produced `pixels` --
+    /// `defilter_sequential`'s own decoder loop). But when the caller
+    /// already owns `pixels` outright, a fresh copy is never the only
+    /// option -- `Vec::truncate` on the caller's own buffer is a true
+    /// no-op, no bytes moved at all (this fast path's exact-8bpp-RGBA8
+    /// case never even has trailing bytes to drop). Every other colour-
+    /// type/bit-depth combination still allocates and writes a fresh
+    /// output buffer exactly like `expand` does -- there's no owned-input
+    /// trick that helps when the transform itself is non-trivial (e.g.
+    /// indexed-color's palette lookup or sub-byte bit-unpacking); this is
+    /// specifically closing the one case that was a pure identity
+    /// transform paying for a copy it didn't need.
+    ///
+    /// # Errors
+    ///
+    /// Same as `expand`.
+    pub fn expand_owned(&self, mut pixels: Vec<u8>) -> Result<Vec<u8>, ExpandError> {
+        if self.ihdr.color_type == ColorType::IndexedColor && self.palette.is_none() {
+            return Err(ExpandError::MissingPalette);
+        }
+
+        let stride = self.ihdr.stride();
+        let width = self.ihdr.width as usize;
+        let height = self.ihdr.height as usize;
+        if pixels.len() < stride * height {
+            return Err(ExpandError::TruncatedPixels);
+        }
+
+        // Same fast path as `expand`'s own (see that method's comment for
+        // why this transform is provably a no-op at 8-bit TruecolorAlpha)
+        // -- but landing on `Vec::truncate` instead of `to_vec()`, since
+        // `pixels` is already exactly the right bytes in an owned buffer:
+        // no copy needed, just drop whatever (if anything) trails the
+        // image's own `width * height * 4` bytes.
+        if self.ihdr.color_type == ColorType::TruecolorAlpha && self.ihdr.bit_depth == 8 {
+            pixels.truncate(width * height * 4);
+            return Ok(pixels);
+        }
+
+        // Every other case has no such identity-transform shortcut --
+        // delegate to `expand`'s borrowing path exactly as before.
+        self.expand(&pixels)
     }
 
     /// Fast path for `expand` at 8-bit `Grayscale`: writes directly into
@@ -369,6 +426,93 @@ mod tests {
         let pixels = [10u8, 20, 30, 128];
         let rgba = expander.expand(&pixels).unwrap();
         assert_eq!(rgba, vec![10, 20, 30, 128]);
+    }
+
+    /// `expand_owned`'s 8-bit `TruecolorAlpha` fast path (`Vec::truncate`
+    /// in place, no `to_vec()`) must produce byte-identical output to
+    /// `expand`'s own `to_vec()`-based fast path -- this is the whole
+    /// point of the method (see its doc comment), so a divergence here
+    /// would silently reintroduce the copy this exists to avoid, or worse,
+    /// produce wrong pixels.
+    #[test]
+    fn expand_owned_truecolor_alpha_fast_path_matches_expand() {
+        let ihdr = ihdr(2, 2, 8, ColorType::TruecolorAlpha);
+        let expander = RgbaExpander::new(&ihdr, None, None);
+        let pixels = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let via_expand = expander.expand(&pixels).unwrap();
+        let via_owned = expander.expand_owned(pixels).unwrap();
+        assert_eq!(via_expand, via_owned);
+    }
+
+    /// `expand_owned` on any colour type/bit-depth *without* its own
+    /// fast path (here: 8-bit `Grayscale`) must delegate to exactly the
+    /// same per-pixel logic `expand` uses -- this exercises that fallback
+    /// branch specifically, not just the `TruecolorAlpha` fast path above.
+    #[test]
+    fn expand_owned_falls_back_to_expand_for_non_fast_path_color_types() {
+        let ihdr = ihdr(2, 2, 8, ColorType::Grayscale);
+        let expander = RgbaExpander::new(&ihdr, None, None);
+        let pixels = vec![10u8, 20, 30, 40];
+        let via_expand = expander.expand(&pixels).unwrap();
+        let via_owned = expander.expand_owned(pixels).unwrap();
+        assert_eq!(via_expand, via_owned);
+    }
+
+    /// `expand_owned` must reject a too-short buffer exactly like `expand`
+    /// does, not just take whatever's there and read out of bounds.
+    #[test]
+    fn expand_owned_rejects_truncated_pixel_buffer() {
+        let ihdr = ihdr(2, 2, 8, ColorType::TruecolorAlpha);
+        let expander = RgbaExpander::new(&ihdr, None, None);
+        let pixels = vec![0u8; 4]; // needs 16 bytes (2x2x4), only has 4
+        let err = expander.expand_owned(pixels).unwrap_err();
+        assert!(matches!(err, ExpandError::TruncatedPixels));
+    }
+
+    /// `expand_owned` must agree byte-for-byte with `expand` on the same
+    /// input for every case `expand` itself is tested against here --
+    /// this one specifically exercises the owned fast path's
+    /// `Vec::truncate`-instead-of-`to_vec` shortcut at 8-bit
+    /// `TruecolorAlpha` (the whole reason `expand_owned` exists), while
+    /// the next test below covers the "falls through to `expand`" case
+    /// for everything else.
+    #[test]
+    fn expand_owned_matches_expand_for_8bit_truecolor_alpha_fast_path() {
+        let ihdr = ihdr(2, 2, 8, ColorType::TruecolorAlpha);
+        let expander = RgbaExpander::new(&ihdr, None, None);
+        let pixels = vec![
+            1u8, 2, 3, 4, // row 0, pixel 0
+            5, 6, 7, 8, // row 0, pixel 1
+            9, 10, 11, 12, // row 1, pixel 0
+            13, 14, 15, 16, // row 1, pixel 1
+        ];
+        let via_borrow = expander.expand(&pixels).unwrap();
+        let via_owned = expander.expand_owned(pixels).unwrap();
+        assert_eq!(via_owned, via_borrow);
+    }
+
+    /// `expand_owned` on a colour type/bit-depth combination that has no
+    /// owned-buffer shortcut (falls through to `self.expand(&pixels)`
+    /// internally) must still agree with calling `expand` directly.
+    #[test]
+    fn expand_owned_matches_expand_when_falling_through_to_the_generic_path() {
+        let ihdr = ihdr(2, 2, 8, ColorType::Grayscale);
+        let expander = RgbaExpander::new(&ihdr, None, None);
+        let pixels = vec![10u8, 20, 30, 40];
+        let via_borrow = expander.expand(&pixels).unwrap();
+        let via_owned = expander.expand_owned(pixels).unwrap();
+        assert_eq!(via_owned, via_borrow);
+    }
+
+    /// `expand_owned` must surface the same errors `expand` would --
+    /// taking ownership of `pixels` shouldn't change error behaviour,
+    /// just who owns the (unused, on error) input buffer.
+    #[test]
+    fn expand_owned_propagates_errors_like_expand() {
+        let ihdr = ihdr(2, 1, 8, ColorType::TruecolorAlpha);
+        let expander = RgbaExpander::new(&ihdr, None, None);
+        let err = expander.expand_owned(vec![0u8; 4]).unwrap_err();
+        assert!(matches!(err, ExpandError::TruncatedPixels));
     }
 
     /// Exercises the `expand`-level fast path for 8-bit `TruecolorAlpha`

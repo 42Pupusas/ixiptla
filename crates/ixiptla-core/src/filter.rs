@@ -1,4 +1,4 @@
-use crate::{FilterType, Ihdr};
+use crate::{FilterScorer, FilterType, Ihdr};
 
 /// Applies PNG's per-scanline byte filtering (spec §9) — the forward
 /// direction of [`crate::Defilter`], plus the choice of *which* filter to
@@ -115,19 +115,11 @@ impl Filter {
     ///
     /// # The heuristic
     ///
-    /// This is libpng's long-standing rule: score each candidate by summing
-    /// its filtered bytes interpreted as *signed* residuals, and keep the
-    /// smallest total. The reasoning is that DEFLATE codes small,
-    /// repetitive values in shorter Huffman codes, so a row whose residuals
-    /// cluster near zero compresses better — the sum is a cheap proxy for
-    /// "how much entropy did this filter leave behind".
-    ///
-    /// It is only a proxy: it can't see cross-row redundancy or the actual
-    /// Huffman code lengths DEFLATE will assign, so it occasionally picks a
-    /// filter that isn't truly optimal. Measuring the real cost would mean
-    /// compressing each candidate, which is far too expensive per row. In
-    /// practice this heuristic lands within a couple of percent of that
-    /// exhaustive search, which is why essentially every encoder uses it.
+    /// Selection itself lives in [`FilterScorer`] — see that module for the
+    /// heuristic and for why it scores all five candidates in a single pass
+    /// rather than materializing each one. This method is just the pairing
+    /// of "ask which filter wins" with "apply it", which is the only shape
+    /// callers actually want.
     ///
     /// # Panics
     ///
@@ -136,49 +128,20 @@ impl Filter {
         &self,
         row: &[u8],
         previous_row: &[u8],
-        scratch: &mut Vec<u8>,
         out: &mut Vec<u8>,
     ) -> FilterType {
-        // Row 0 of an image/pass has an all-zero row above it, so Up
-        // degenerates to None, and Average/Paeth degenerate to weaker forms
-        // of Sub. Scoring them anyway is pure waste, but correctness does
-        // not depend on this shortcut -- it only trims the candidate set.
-        let previous_is_zero = previous_row.iter().all(|&b| b == 0);
-        let candidates: &[FilterType] = if previous_is_zero {
-            &[FilterType::None, FilterType::Sub]
-        } else {
-            &FilterType::ALL
-        };
-
-        let mut best = FilterType::None;
-        let mut best_score = u64::MAX;
-        for &candidate in candidates {
-            scratch.clear();
-            self.filter_row_into(candidate, row, previous_row, scratch);
-            // Skip the filter-type byte: it is framing, not residual data.
-            let score = Self::absolute_difference_score(&scratch[1..]);
-            if score < best_score {
-                best_score = score;
-                best = candidate;
-            }
-        }
-
+        let best = FilterScorer::new(self.bpp).best_filter(row, previous_row);
+        // Only the winner is ever materialized; the four losing candidates
+        // are never written anywhere.
         self.filter_row_into(best, row, previous_row, out);
         best
     }
 
-    /// Sum of the filtered bytes read as signed residuals (libpng's
-    /// "minimum sum of absolute differences" metric).
-    ///
-    /// A filtered byte is a wrapped difference, so `0xFF` means -1, not
-    /// 255. Reading it back as `i8` and taking the magnitude is what makes
-    /// a residual of -1 score as cheaply as +1, which is the entire point:
-    /// small differences in either direction are what compress well.
-    fn absolute_difference_score(filtered: &[u8]) -> u64 {
-        filtered
-            .iter()
-            .map(|&byte| u64::from(byte.cast_signed().unsigned_abs()))
-            .sum()
+    /// Test-only accessor for the predictor, so `filter_scorer`'s tests
+    /// can assert its own duplicated copy never drifts from this one.
+    #[cfg(test)]
+    pub(crate) const fn paeth_predictor_for_test(a: u8, b: u8, c: u8) -> u8 {
+        Self::paeth_predictor(a, b, c)
     }
 
     /// The Paeth predictor (spec §9.4), identical to the decode side's.
@@ -361,73 +324,31 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_choice_round_trips_and_beats_or_matches_no_filtering() {
+    fn adaptive_emits_the_filter_it_reports_and_round_trips() {
+        // `filter_row_adaptive_into`'s own contract, now that *which*
+        // filter wins is `FilterScorer`'s business and tested there: the
+        // byte it writes must match the filter it returns, and the result
+        // must still decode back to the original row.
         let case = RoundTrip::new(64, ColorType::Truecolor, 8);
         let stride = case.stride();
         let filter = Filter::new(case.header());
 
-        // A smooth horizontal gradient: strongly favours Sub, and must
-        // never score worse than leaving the row unfiltered.
-        let row = RoundTrip::row(stride, 3, 0);
-        let previous = RoundTrip::row(stride, 3, 0);
+        for previous in [
+            vec![0u8; stride],
+            RoundTrip::row(stride, 3, 0),
+            RoundTrip::row(stride, 91, 5),
+        ] {
+            let row = RoundTrip::row(stride, 3, 0);
+            let mut out = Vec::new();
+            let chosen = filter.filter_row_adaptive_into(&row, &previous, &mut out);
 
-        let mut scratch = Vec::new();
-        let mut out = Vec::new();
-        let chosen = filter.filter_row_adaptive_into(&row, &previous, &mut scratch, &mut out);
-
-        let mut unfiltered = Vec::new();
-        filter.filter_row_into(FilterType::None, &row, &previous, &mut unfiltered);
-        assert!(
-            Filter::absolute_difference_score(&out[1..])
-                <= Filter::absolute_difference_score(&unfiltered[1..])
-        );
-
-        assert_eq!(out[0], chosen.to_byte());
-        Defilter::new(case.header())
-            .defilter_row(&mut out, &previous)
-            .unwrap();
-        assert_eq!(&out[1..], &row[..]);
-    }
-
-    #[test]
-    fn adaptive_picks_up_for_vertically_repeating_rows() {
-        // Identical consecutive rows are exactly what Up is for: every
-        // residual becomes zero, which no other filter can match here.
-        let case = RoundTrip::new(32, ColorType::Truecolor, 8);
-        let row = RoundTrip::row(case.stride(), 7, 13);
-        let chosen = Filter::new(case.header()).filter_row_adaptive_into(
-            &row,
-            &row.clone(),
-            &mut Vec::new(),
-            &mut Vec::new(),
-        );
-        assert_eq!(chosen, FilterType::Up);
-    }
-
-    #[test]
-    fn adaptive_restricts_candidates_on_an_all_zero_previous_row() {
-        // With no row above, Up is equivalent to None and must never be
-        // selected over it -- the tie would otherwise waste a byte's worth
-        // of ambiguity and the shortcut would be unobservable.
-        let case = RoundTrip::new(16, ColorType::Grayscale, 8);
-        let row = RoundTrip::row(case.stride(), 5, 0);
-        let chosen = Filter::new(case.header()).filter_row_adaptive_into(
-            &row,
-            &vec![0u8; case.stride()],
-            &mut Vec::new(),
-            &mut Vec::new(),
-        );
-        assert!(matches!(chosen, FilterType::None | FilterType::Sub));
-    }
-
-    #[test]
-    fn score_reads_filtered_bytes_as_signed_residuals() {
-        // 0xFF is -1, so it must score 1, not 255 -- the property that makes
-        // the metric symmetric around zero.
-        assert_eq!(Filter::absolute_difference_score(&[0xFF]), 1);
-        assert_eq!(Filter::absolute_difference_score(&[0x01]), 1);
-        assert_eq!(Filter::absolute_difference_score(&[0x80]), 128);
-        assert_eq!(Filter::absolute_difference_score(&[0, 0, 0]), 0);
+            assert_eq!(out[0], chosen.to_byte());
+            assert_eq!(out.len(), stride + 1);
+            Defilter::new(case.header())
+                .defilter_row(&mut out, &previous)
+                .unwrap();
+            assert_eq!(&out[1..], &row[..]);
+        }
     }
 
     #[test]

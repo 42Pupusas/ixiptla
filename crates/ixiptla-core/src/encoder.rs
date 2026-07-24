@@ -177,12 +177,11 @@ impl Encoder {
         // Row 0's "row above" is all zeroes (spec §9.2), and reusing one
         // buffer avoids allocating per row.
         let mut previous = vec![0u8; stride];
-        let mut scratch = Vec::with_capacity(stride + 1);
 
         for row in pixels.chunks_exact(stride) {
             match self.strategy {
                 FilterStrategy::Adaptive => {
-                    filter.filter_row_adaptive_into(row, &previous, &mut scratch, out);
+                    filter.filter_row_adaptive_into(row, &previous, out);
                 }
                 FilterStrategy::Fixed(filter_type) => {
                     filter.filter_row_into(filter_type, row, &previous, out);

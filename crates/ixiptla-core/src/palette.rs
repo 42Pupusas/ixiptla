@@ -20,7 +20,7 @@ impl Palette {
     /// 3-byte entries, or [`PaletteError::TooManyEntries`] if there are
     /// more than the 256 an 8-bit index could ever address.
     pub fn parse(data: &[u8]) -> Result<Self, PaletteError> {
-        if data.len() % 3 != 0 {
+        if !data.len().is_multiple_of(3) {
             return Err(PaletteError::InvalidLength(data.len()));
         }
         let entries: Vec<[u8; 3]> = data.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
@@ -32,13 +32,13 @@ impl Palette {
 
     /// How many entries this palette has.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// True if this palette has no entries at all.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 

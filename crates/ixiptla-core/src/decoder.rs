@@ -1,3 +1,4 @@
+use crate::idat::IdatAccumulator;
 use crate::{
     Adam7, ChunkError, ChunkReader, ColorType, Defilter, Ihdr, IhdrError, InterlaceMethod,
     InvalidFilterType, Palette, PaletteError, Signature, SignatureError, Transparency,
@@ -61,18 +62,25 @@ impl Png {
         // PLTE (spec §4.3, §11.2.3) must precede the first IDAT when present;
         // we don't enforce that ordering strictly here (a spec-violating but
         // otherwise-decodable file), just take whichever PLTE data we see.
-        // `input.len()` upper-bounds how many bytes of `IDAT` payload
-        // could possibly exist in this file (they're a subset of it, plus
-        // per-chunk overhead) -- reserving against that avoids `idat`
-        // paying for `Vec`'s repeated grow-and-copy doubling as chunks
-        // accumulate, for the cost of one conservative up-front
-        // allocation instead.
-        let mut idat = Vec::with_capacity(input.len());
+        //
+        // `IdatAccumulator` keeps a zero-copy borrow of `input` for the
+        // (overwhelmingly common) single-`IDAT`-chunk file, only paying
+        // for an owned concatenation buffer if a second `IDAT` chunk
+        // actually shows up -- see its doc comment for the measured
+        // allocation win this closed (previously: every decode paid for
+        // one whole extra image-sized `Vec` + memcpy here, even for
+        // files with just one `IDAT`). `input.len()` upper-bounds how
+        // many bytes of `IDAT` payload could possibly exist in this file
+        // (a subset of it, plus per-chunk overhead), used only if/when a
+        // second chunk forces the owned path, so a genuinely multi-chunk
+        // file still gets one right-sized allocation instead of `Vec`'s
+        // repeated grow-and-copy doubling.
+        let mut idat = IdatAccumulator::new();
         let mut palette = None;
         let mut transparency = None;
         while let Some(chunk) = reader.next_chunk()? {
             match chunk.kind_str() {
-                Some("IDAT") => idat.extend_from_slice(chunk.data()),
+                Some("IDAT") => idat.push(chunk.data(), input.len()),
                 Some("PLTE") => palette = Some(Palette::parse(chunk.data())?),
                 Some("tRNS") => {
                     transparency = Some(Transparency::parse(ihdr.color_type, chunk.data())?);
@@ -100,8 +108,11 @@ impl Png {
         // hint turns however many doubling reallocations a wrong guess
         // costs into exactly one.
         let inflated_size_hint = Self::expected_inflated_size(&ihdr);
-        let inflated =
-            ixchel::zlib::decompress_with_hint(&idat, max_decompressed, Some(inflated_size_hint))?;
+        let inflated = ixchel::zlib::decompress_with_hint(
+            idat.as_slice(),
+            max_decompressed,
+            Some(inflated_size_hint),
+        )?;
 
         let pixels = match ihdr.interlace {
             InterlaceMethod::None => Self::defilter_sequential(&ihdr, inflated)?,
@@ -183,7 +194,7 @@ impl Png {
     // checker can be shown that directly instead of this needing `unsafe`.
     fn defilter_sequential(ihdr: &Ihdr, mut inflated: Vec<u8>) -> Result<Vec<u8>, DecodeError> {
         let row_len = 1 + ihdr.stride();
-        if inflated.len() % row_len != 0 {
+        if !inflated.len().is_multiple_of(row_len) {
             return Err(DecodeError::TruncatedImageData);
         }
         let row_count = inflated.len() / row_len;

@@ -70,10 +70,14 @@ const MIN_ACCELERATED_LEN: usize = 128;
 /// intrinsic in `core::arch`), so the cast from the constant's natural
 /// `u64` bit pattern is an intentional reinterpretation, not a real
 /// value that could wrap.
-#[allow(clippy::cast_possible_wrap)]
-const K1: i64 = 0x0000_0001_5444_2bd4u64 as i64;
-#[allow(clippy::cast_possible_wrap)]
-const K2: i64 = 0x0000_0001_c6e4_1596u64 as i64;
+// `pub(crate)`, not `pub`, but `redundant_pub_crate` doesn't see that
+// `crc32_vpclmulqdq` (a sibling module, not a descendant) needs crate
+// visibility, not module-private -- these genuinely aren't usable outside
+// the crate, so `pub` would be wrong; silenced rather than widened.
+#[allow(clippy::cast_possible_wrap, clippy::redundant_pub_crate)]
+pub(crate) const K1: i64 = 0x0000_0001_5444_2bd4u64 as i64;
+#[allow(clippy::cast_possible_wrap, clippy::redundant_pub_crate)]
+pub(crate) const K2: i64 = 0x0000_0001_c6e4_1596u64 as i64;
 #[allow(clippy::cast_possible_wrap)]
 const K3: i64 = 0x0000_0001_7519_97d0u64 as i64;
 #[allow(clippy::cast_possible_wrap)]
@@ -166,6 +170,33 @@ impl Pclmulqdq {
                 x0 = Self::reduce128(x0, Self::load(&mut data), k1k2);
             }
 
+            Self::converge(x3, x2, x1, x0, data)
+        }
+    }
+
+    /// Steps 1b-4: converge 4 independent 128-bit accumulators (already
+    /// folded up to some common byte position, `tail` holding whatever
+    /// wasn't consumed to produce them) down to the final register-domain
+    /// `u32` CRC. Pulled out of [`Self::fold`] so
+    /// [`crate::crc32_vpclmulqdq::Vpclmulqdq`]'s wider AVX2 front end
+    /// (which produces the same 4-accumulator shape via 256-bit loads
+    /// instead of 128-bit ones, two lanes per fold instead of one) can
+    /// reuse this exact, already-verified tail instead of re-deriving its
+    /// own copy of the fold-by-16-convergence/Barrett-reduction math.
+    ///
+    /// # Safety
+    ///
+    /// Caller must have already confirmed `pclmulqdq`, `sse2`, and
+    /// `sse4.1` are available (see [`Self::try_update`]).
+    #[target_feature(enable = "pclmulqdq", enable = "sse2", enable = "sse4.1")]
+    pub(crate) unsafe fn converge(
+        x3: __m128i,
+        x2: __m128i,
+        x1: __m128i,
+        x0: __m128i,
+        mut data: &[u8],
+    ) -> u32 {
+        unsafe {
             // Step 1b: converge the 4 accumulators down to 1, still via
             // the same fold-by-16 reduction (fold distances 48, 32, 16
             // positions, expressed via the same K3/K4 constant pair since

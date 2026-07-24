@@ -75,12 +75,13 @@ impl Crc32 {
 
     /// Fold more bytes into the running CRC.
     ///
-    /// On `x86_64`, tries the PCLMULQDQ carry-less-multiply folding path
-    /// first (see [`crate::crc32_pclmulqdq::Pclmulqdq`]) -- it declines
-    /// (returning control here) for short inputs or CPUs lacking the
-    /// needed instructions, in which case (and on every other
-    /// architecture) this falls back to the scalar slicing-by-8 path
-    /// below.
+    /// On `x86_64`, tries the wider VPCLMULQDQ+AVX2 folding path first
+    /// (see [`crate::crc32_vpclmulqdq::Vpclmulqdq`]), then the plain
+    /// PCLMULQDQ path (see [`crate::crc32_pclmulqdq::Pclmulqdq`]) -- each
+    /// declines (returning control here) for short inputs or CPUs
+    /// lacking the needed instructions, in which case (and on every
+    /// other architecture) this falls back to the scalar slicing-by-8
+    /// path below.
     pub fn update(&mut self, bytes: &[u8]) -> &mut Self {
         self.state = Self::update_state(self.state, bytes);
         self
@@ -89,6 +90,15 @@ impl Crc32 {
     fn update_state(state: u32, bytes: &[u8]) -> u32 {
         #[cfg(target_arch = "x86_64")]
         {
+            // Try the wider VPCLMULQDQ+AVX2 fold first (halves the
+            // fold-by-64 loop's multiply-instruction count over the
+            // plain PCLMULQDQ path -- see `crc32_vpclmulqdq`'s module
+            // doc) -- it declines on CPUs lacking VPCLMULQDQ/AVX2, in
+            // which case the plain PCLMULQDQ path (declining in turn for
+            // CPUs lacking even that, or short inputs) is tried next.
+            if let Some(folded) = crate::crc32_vpclmulqdq::Vpclmulqdq::try_update(state, bytes) {
+                return folded;
+            }
             if let Some(folded) = crate::crc32_pclmulqdq::Pclmulqdq::try_update(state, bytes) {
                 return folded;
             }

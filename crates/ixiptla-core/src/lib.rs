@@ -15,9 +15,12 @@ mod color_type;
 mod crc32;
 #[cfg(target_arch = "x86_64")]
 mod crc32_pclmulqdq;
+#[cfg(target_arch = "x86_64")]
+mod crc32_vpclmulqdq;
 mod decoder;
 mod defilter;
 mod filter_type;
+mod idat;
 mod ihdr;
 mod palette;
 mod pixel_bits;

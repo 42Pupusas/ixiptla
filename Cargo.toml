@@ -8,11 +8,16 @@ edition = "2024"
 license = "MIT"
 authors = ["cuarentaydos"]
 repository = "https://github.com/42Pupusas/ixiptla"
-rust-version = "1.85"
+# 1.89 (not 1.85) because `ixiptla-core`'s `crc32_vpclmulqdq` module uses
+# `_mm256_clmulepi64_epi128` (VPCLMULQDQ's 256-bit carry-less multiply),
+# stabilized in that release -- see that module's doc comment for why the
+# wider fold is worth the bump.
+rust-version = "1.89"
 
 [workspace.dependencies]
 ixchel = { path = "../ixchel" }
 ixiptla-core = { path = "crates/ixiptla-core", version = "0.1.0" }
+quetzalcoatl = { path = "../quetzalcoatl", version = "0.13" }
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"

@@ -11,5 +11,18 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Off by default -- this crate's whole pitch (see its description above
+# and lib.rs's module doc) is "zero-dep PNG decoder core"; a default
+# build must not pull in anything beyond `ixchel`. Turning this feature
+# on adds `quetzalcoatl` (a lock-free ring buffer crate) and lets
+# `Png::decode` spread the per-row `Sub`/`Average`/`Paeth` defiltering
+# work for wide-enough pixel formats across a short-lived pool of worker
+# threads instead of running it on one thread -- see
+# `parallel_defilter`'s module doc for why this is a real, not just
+# throughput-theoretical, speedup for those three filters specifically.
+parallel = ["dep:quetzalcoatl"]
+
 [dependencies]
 ixchel.workspace = true
+quetzalcoatl = { workspace = true, optional = true }

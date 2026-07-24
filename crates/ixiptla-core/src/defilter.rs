@@ -7,43 +7,50 @@ use crate::{FilterType, Ihdr, InvalidFilterType};
 /// inflated `IDAT` byte stream (filter-type byte + filtered bytes, repeated
 /// per row) back into raw pixel bytes.
 ///
-/// This owns the "previous reconstructed scanline" state that `Up`,
-/// `Average`, and `Paeth` all need — keeping it here (rather than having
-/// callers pass the previous row in and out by hand) means a caller just
-/// calls [`Self::defilter_row`] once per scanline, in order, and the struct
-/// tracks continuity itself. Interlacing (`Adam7`) is *not* handled here:
-/// each `Adam7` pass is its own independent sequence of scanlines with its
-/// own "previous row" state, so the `Adam7` module drives one `Defilter`
-/// per pass.
+/// Unlike an earlier version of this struct, this does *not* itself own a
+/// copy of the "previous reconstructed scanline" `Up`/`Average`/`Paeth`
+/// need -- [`Self::defilter_row`] takes it as an explicit `&[u8]`
+/// parameter instead. Both real callers ([`crate::Png`]'s sequential path
+/// and its `Adam7` path) already have the previous row's exact bytes
+/// sitting in a buffer they own by the time they call this (the
+/// compacted output buffer's tail, or the growing per-pass pixel buffer's
+/// tail, respectively) -- an internal copy here would just be a second,
+/// redundant copy of bytes the caller already has, paid on *every* row of
+/// every image. Making the caller responsible for tracking "what's the
+/// previous row" (usually free -- a slice into a buffer it's already
+/// building) instead of this struct maintaining its own private copy
+/// removed one full-row `memcpy` per scanline from the hot path (measured
+/// as a real chunk of `defilter_row`'s own `perf` time before this
+/// change, not just a theoretical saving).
 #[derive(Debug)]
 pub struct Defilter {
     /// Bytes per complete pixel (spec's "bpp"), used as the `Sub`/`Average`/
     /// `Paeth` predictors' fixed left-neighbor stride.
     bpp: usize,
-    /// The previously reconstructed scanline, or all-zero for the first row
-    /// (spec §9.2: "Filt(x) is treated as ... equal to zero" for the row
-    /// above the first, i.e. `Recon(b) = 0` on row 0).
-    previous_row: Vec<u8>,
 }
 
 impl Defilter {
     /// Build a defilterer for scanlines matching `ihdr`'s pixel geometry
-    /// (bpp = bytes per complete pixel) and stride (row width in bytes).
+    /// (bpp = bytes per complete pixel).
     #[must_use]
-    pub fn new(ihdr: &Ihdr) -> Self {
+    pub const fn new(ihdr: &Ihdr) -> Self {
         Self {
             bpp: ihdr.bytes_per_pixel(),
-            previous_row: vec![0u8; ihdr.stride()],
         }
     }
 
     /// Defilter one scanline in place.
     ///
-    /// `row` must be exactly `filter_type_byte + stride bytes` — i.e. the
+    /// `row` must be exactly `filter_type_byte + stride` bytes — i.e. the
     /// leading filter-type byte plus the filtered row content, sliced
-    /// straight out of the inflated `IDAT` stream. On success, `row[1..]`
-    /// holds the reconstructed (unfiltered) pixel bytes, and the struct
-    /// remembers this row as `previous_row` for the next call.
+    /// straight out of the inflated `IDAT` stream. `previous_row` must be
+    /// exactly `stride` bytes: the previously *reconstructed* (not
+    /// filtered) scanline, or all-zero for the first row of an image/pass
+    /// (spec §9.2: "Filt(x) is treated as ... equal to zero" for the row
+    /// above the first, i.e. `Recon(b) = 0` on row 0). On success,
+    /// `row[1..]` holds the reconstructed (unfiltered) pixel bytes; the
+    /// caller is responsible for using them as the next call's
+    /// `previous_row`.
     ///
     /// # Errors
     ///
@@ -54,7 +61,11 @@ impl Defilter {
     /// well-formed `IDAT` stream, whose stride is always >= 0 content
     /// bytes plus exactly one filter-type byte) is treated as `FilterType::
     /// None` over zero content bytes, i.e. a harmless no-op.
-    pub fn defilter_row(&mut self, row: &mut [u8]) -> Result<(), InvalidFilterType> {
+    pub fn defilter_row(
+        &self,
+        row: &mut [u8],
+        previous_row: &[u8],
+    ) -> Result<(), InvalidFilterType> {
         let Some((filter_byte, content)) = row.split_first_mut() else {
             return Ok(());
         };
@@ -63,12 +74,11 @@ impl Defilter {
         match filter_type {
             FilterType::None => {}
             FilterType::Sub => self.undo_sub(content),
-            FilterType::Up => self.undo_up(content),
-            FilterType::Average => self.undo_average(content),
-            FilterType::Paeth => self.undo_paeth(content),
+            FilterType::Up => Self::undo_up(content, previous_row),
+            FilterType::Average => self.undo_average(content, previous_row),
+            FilterType::Paeth => self.undo_paeth(content, previous_row),
         }
 
-        self.previous_row.copy_from_slice(content);
         Ok(())
     }
 
@@ -109,8 +119,8 @@ impl Defilter {
     // `WrappingByteAdder`, which does the actual add 16 bytes at a time via
     // SSE2 on x86_64 (falling back to the same scalar loop this used to be,
     // on other architectures).
-    fn undo_up(&self, content: &mut [u8]) {
-        WrappingByteAdder::add_wrapping(content, &self.previous_row);
+    fn undo_up(content: &mut [u8], previous_row: &[u8]) {
+        WrappingByteAdder::add_wrapping(content, previous_row);
     }
 
     /// `Recon(x) = Filt(x) + floor((Recon(a) + Recon(b)) / 2)`.
@@ -131,17 +141,17 @@ impl Defilter {
     // in the suffix loop: each iteration reads back `content[i - bpp]`, an
     // *already reconstructed* earlier element of the same slice we're
     // writing -- not expressible as a plain iterator without a second pass.
-    fn undo_average(&self, content: &mut [u8]) {
+    fn undo_average(&self, content: &mut [u8], previous_row: &[u8]) {
         let bpp = self.bpp;
         let prefix_len = bpp.min(content.len());
-        for (byte, &above) in content[..prefix_len].iter_mut().zip(&self.previous_row) {
+        for (byte, &above) in content[..prefix_len].iter_mut().zip(previous_row) {
             *byte = byte.wrapping_add(above / 2); // a == 0: floor(b/2).
         }
         // Suffix (i >= bpp): delegated to WrappingAverageScan, which does
         // the same pixel-at-a-time floor((a+b)/2) reconstruction but via
         // one SSE2 pavgb (+ off-by-one floor correction) per whole pixel
         // on x86_64, instead of a scalar u16-widened divide per byte.
-        WrappingAverageScan::scan_suffix(content, &self.previous_row, bpp);
+        WrappingAverageScan::scan_suffix(content, previous_row, bpp);
     }
 
     /// `Recon(x) = Filt(x) + PaethPredictor(Recon(a), Recon(b), Recon(c))`.
@@ -156,10 +166,10 @@ impl Defilter {
     //
     // Same self-referencing-slice reason as `undo_average` above: `a` and
     // `c` read back already-reconstructed earlier elements of `content`.
-    fn undo_paeth(&self, content: &mut [u8]) {
+    fn undo_paeth(&self, content: &mut [u8], previous_row: &[u8]) {
         let bpp = self.bpp;
         let prefix_len = bpp.min(content.len());
-        for (byte, &above) in content[..prefix_len].iter_mut().zip(&self.previous_row) {
+        for (byte, &above) in content[..prefix_len].iter_mut().zip(previous_row) {
             *byte = byte.wrapping_add(above);
         }
         // Suffix (i >= bpp): delegated to WrappingPaethScan, which computes
@@ -167,7 +177,7 @@ impl Defilter {
         // instruction batch (i16 lanes; no native u8 abs/select in
         // baseline SSE2) on x86_64, instead of bpp scalar predictor calls
         // per pixel.
-        WrappingPaethScan::scan_suffix(content, &self.previous_row, bpp);
+        WrappingPaethScan::scan_suffix(content, previous_row, bpp);
     }
 }
 
@@ -190,9 +200,9 @@ mod tests {
     #[test]
     fn filter_type_none_is_identity() {
         let ihdr = grayscale_ihdr(4, 2);
-        let mut defilter = Defilter::new(&ihdr);
+        let defilter = Defilter::new(&ihdr);
         let mut row = vec![0u8, 10, 20, 30, 40]; // filter byte + 4 content bytes
-        defilter.defilter_row(&mut row).unwrap();
+        defilter.defilter_row(&mut row, &[0u8; 4]).unwrap();
         assert_eq!(&row[1..], &[10, 20, 30, 40]);
     }
 
@@ -201,25 +211,25 @@ mod tests {
         // Original row: [10, 20, 30, 40]. Sub-filtered: [10, 10, 10, 10]
         // (each byte minus its bpp=1 left neighbor, first byte minus 0).
         let ihdr = grayscale_ihdr(4, 1);
-        let mut defilter = Defilter::new(&ihdr);
+        let defilter = Defilter::new(&ihdr);
         let mut row = vec![1u8, 10, 10, 10, 10];
-        defilter.defilter_row(&mut row).unwrap();
+        defilter.defilter_row(&mut row, &[0u8; 4]).unwrap();
         assert_eq!(&row[1..], &[10, 20, 30, 40]);
     }
 
     #[test]
     fn up_filter_undoes_delta_from_previous_row() {
         let ihdr = grayscale_ihdr(4, 2);
-        let mut defilter = Defilter::new(&ihdr);
+        let defilter = Defilter::new(&ihdr);
 
         // Row 0, unfiltered, establishes previous_row = [10, 20, 30, 40].
         let mut row0 = vec![0u8, 10, 20, 30, 40];
-        defilter.defilter_row(&mut row0).unwrap();
+        defilter.defilter_row(&mut row0, &[0u8; 4]).unwrap();
 
         // Row 1, Up-filtered: each byte is original minus the byte above.
         // Original row 1 = [11, 22, 33, 44] -> filtered = [1, 2, 3, 4].
         let mut row1 = vec![2u8, 1, 2, 3, 4];
-        defilter.defilter_row(&mut row1).unwrap();
+        defilter.defilter_row(&mut row1, &row0[1..]).unwrap();
         assert_eq!(&row1[1..], &[11, 22, 33, 44]);
     }
 
@@ -232,9 +242,9 @@ mod tests {
         // avg-filtered[2] = 30 - floor((20+0)/2) = 20
         // avg-filtered[3] = 40 - floor((30+0)/2) = 25
         let ihdr = grayscale_ihdr(4, 1);
-        let mut defilter = Defilter::new(&ihdr);
+        let defilter = Defilter::new(&ihdr);
         let mut row = vec![3u8, 10, 15, 20, 25];
-        defilter.defilter_row(&mut row).unwrap();
+        defilter.defilter_row(&mut row, &[0u8; 4]).unwrap();
         assert_eq!(&row[1..], &[10, 20, 30, 40]);
     }
 
@@ -244,20 +254,20 @@ mod tests {
         // picking a (since p=a, pa=0 is always <= pb=|a-... |). So Paeth on
         // row 0 behaves exactly like Sub.
         let ihdr = grayscale_ihdr(4, 1);
-        let mut defilter = Defilter::new(&ihdr);
+        let defilter = Defilter::new(&ihdr);
         let mut row = vec![4u8, 10, 10, 10, 10]; // same deltas as the Sub test
-        defilter.defilter_row(&mut row).unwrap();
+        defilter.defilter_row(&mut row, &[0u8; 4]).unwrap();
         assert_eq!(&row[1..], &[10, 20, 30, 40]);
     }
 
     #[test]
     fn paeth_filter_second_row_matches_hand_worked_example() {
         let ihdr = grayscale_ihdr(3, 2);
-        let mut defilter = Defilter::new(&ihdr);
+        let defilter = Defilter::new(&ihdr);
 
         // Row 0 unfiltered: [5, 10, 15] (bpp=1).
         let mut row0 = vec![0u8, 5, 10, 15];
-        defilter.defilter_row(&mut row0).unwrap();
+        defilter.defilter_row(&mut row0, &[0u8; 3]).unwrap();
 
         // Row 1 original: [6, 12, 18].
         // i=0: a=0,b=5,c=0 -> p=5, pa=5,pb=0,pc=5 -> pick b=5 -> filtered = 6-5=1
@@ -266,16 +276,16 @@ mod tests {
         // i=2: a=12,b=15,c=10 -> p=12+15-10=17, pa=5,pb=2,pc=7 -> pick b=15
         //      -> filtered = 18-15=3
         let mut row1 = vec![4u8, 1, 2, 3];
-        defilter.defilter_row(&mut row1).unwrap();
+        defilter.defilter_row(&mut row1, &row0[1..]).unwrap();
         assert_eq!(&row1[1..], &[6, 12, 18]);
     }
 
     #[test]
     fn rejects_invalid_filter_type_byte() {
         let ihdr = grayscale_ihdr(4, 1);
-        let mut defilter = Defilter::new(&ihdr);
+        let defilter = Defilter::new(&ihdr);
         let mut row = vec![5u8, 1, 2, 3, 4];
-        assert!(defilter.defilter_row(&mut row).is_err());
+        assert!(defilter.defilter_row(&mut row, &[0u8; 4]).is_err());
     }
 
     #[test]
@@ -288,12 +298,12 @@ mod tests {
             color_type: ColorType::Truecolor,
             interlace: InterlaceMethod::None,
         };
-        let mut defilter = Defilter::new(&ihdr);
+        let defilter = Defilter::new(&ihdr);
         // Original pixels: (10,20,30) (15,25,35).
         // Sub-filtered: pixel0 unchanged (no left neighbor), pixel1 minus
         // pixel0 componentwise: (5,5,5).
         let mut row = vec![1u8, 10, 20, 30, 5, 5, 5];
-        defilter.defilter_row(&mut row).unwrap();
+        defilter.defilter_row(&mut row, &[0u8; 6]).unwrap();
         assert_eq!(&row[1..], &[10, 20, 30, 15, 25, 35]);
     }
 }

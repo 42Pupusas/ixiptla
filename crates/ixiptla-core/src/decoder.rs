@@ -120,6 +120,17 @@ impl Png {
     // shrink `Vec::dedup`-style algorithms use; `chunks_mut` still drives
     // the defiltering itself unchanged; only what happens to the result
     // differs.
+    //
+    // `Defilter` itself no longer keeps its own `previous_row` copy (see
+    // its doc comment) -- that "previous reconstructed scanline" is
+    // instead read straight out of `inflated`'s already-compacted prefix
+    // (`inflated[write_offset - stride..write_offset]`, exactly where the
+    // compaction below leaves it) via `split_at_mut`, a genuine zero-copy
+    // borrow rather than a second `memcpy` of every row's content: because
+    // `write_offset` always trails `read_offset` (compaction only ever
+    // removes bytes), the previous row's already-written bytes and the
+    // current row's not-yet-defiltered bytes never overlap, so the borrow
+    // checker can be shown that directly instead of this needing `unsafe`.
     fn defilter_sequential(ihdr: &Ihdr, mut inflated: Vec<u8>) -> Result<Vec<u8>, DecodeError> {
         let row_len = 1 + ihdr.stride();
         if inflated.len() % row_len != 0 {
@@ -133,12 +144,31 @@ impl Png {
             });
         }
 
-        let mut defilter = Defilter::new(ihdr);
+        let defilter = Defilter::new(ihdr);
         let stride = ihdr.stride();
+        // Spec §9.2's "row above the first is all zero" -- unlike the
+        // empty slice an earlier version of this loop passed for row 0,
+        // `Defilter::defilter_row`'s `Up`/`Average`/`Paeth` paths (via
+        // `WrappingByteAdder`/`WrappingAverageScan`/`WrappingPaethScan`)
+        // all assert `previous_row.len() == content.len()`, so row 0
+        // needs a real all-zero `stride`-byte buffer, not a 0-length one.
+        let zero_row = vec![0u8; stride];
         let mut write_offset = 0usize;
         for read_offset in (0..inflated.len()).step_by(row_len) {
-            let row = &mut inflated[read_offset..read_offset + row_len];
-            defilter.defilter_row(row)?;
+            // `write_offset <= read_offset` always (compaction only ever
+            // removes bytes), so `front` (everything before `read_offset`,
+            // including the already-compacted previous row) and `back`
+            // (this row, not yet compacted) never alias -- `split_at_mut`
+            // hands back two genuinely disjoint mutable/immutable borrows
+            // of the same `Vec`, no `unsafe` needed.
+            let (front, back) = inflated.split_at_mut(read_offset);
+            let previous_row: &[u8] = if write_offset == 0 {
+                &zero_row
+            } else {
+                &front[write_offset - stride..write_offset]
+            };
+            let row = &mut back[..row_len];
+            defilter.defilter_row(row, previous_row)?;
             // `row[1..]` (the defiltered content, skipping this row's
             // filter-type byte) needs to end up at
             // `inflated[write_offset..][..stride]`. `write_offset` only
@@ -196,16 +226,37 @@ impl Png {
             let mut pass_data = inflated[offset..pass_end].to_vec();
             offset = pass_end;
 
-            let mut defilter = Defilter::new(&Ihdr {
+            let defilter = Defilter::new(&Ihdr {
                 width: pass.width,
                 height: pass.height,
                 bit_depth: ihdr.bit_depth,
                 color_type: ihdr.color_type,
                 interlace: InterlaceMethod::None,
             });
+            // Spec §9.2's "row above the first is all zero", sized to
+            // this pass's own stride (each pass is its own tiny image --
+            // see this fn's doc comment) -- needed as a real all-zero
+            // buffer, not an empty one, since `Defilter::defilter_row`'s
+            // `Up`/`Average`/`Paeth` paths assert `previous_row.len() ==
+            // content.len()`.
+            let zero_row = vec![0u8; pass_stride];
             let mut pass_pixels = Vec::with_capacity(pass_stride * pass.height as usize);
             for row in pass_data.chunks_mut(row_len) {
-                defilter.defilter_row(row)?;
+                // Zero-copy "previous row" borrow, same shape as
+                // `defilter_sequential` above -- and here it's even more
+                // direct, since `row` (borrowed from `pass_data`) and
+                // `pass_pixels` are two entirely separate `Vec`s, not two
+                // views of the same one, so there's no aliasing to reason
+                // about at all: the last `pass_stride` bytes already
+                // written to `pass_pixels` *are* the previous row, or
+                // `zero_row` on the pass's first row (spec §9.2's row-0
+                // rule again).
+                let previous_row: &[u8] = if pass_pixels.is_empty() {
+                    &zero_row
+                } else {
+                    &pass_pixels[pass_pixels.len() - pass_stride..]
+                };
+                defilter.defilter_row(row, previous_row)?;
                 pass_pixels.extend_from_slice(&row[1..]);
             }
 

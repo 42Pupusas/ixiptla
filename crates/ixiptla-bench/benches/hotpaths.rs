@@ -69,6 +69,34 @@ struct FilteredStream {
 }
 
 impl FilteredStream {
+    /// Defilter every row of `inflated` in place, mirroring
+    /// `ixiptla_core::Png::defilter_sequential`'s own zero-copy "previous
+    /// row" borrow (split at the read cursor, all-zero buffer for row 0)
+    /// -- `Defilter::defilter_row` no longer tracks `previous_row`
+    /// internally, so every caller (this benchmark included) is
+    /// responsible for it now. Kept as a benchmark-local helper rather
+    /// than exposing `Png`'s own private loop, since this crate
+    /// intentionally isolates `Defilter` from the rest of `Png::decode`'s
+    /// pipeline (chunk parsing, zlib inflate) for these benchmarks.
+    fn defilter_all_rows(ihdr: &Ihdr, inflated: &mut [u8]) {
+        let defilter = Defilter::new(ihdr);
+        let stride = ihdr.stride();
+        let row_len = 1 + stride;
+        let zero_row = vec![0u8; stride];
+        let mut write_offset = 0usize;
+        for read_offset in (0..inflated.len()).step_by(row_len) {
+            let (front, back) = inflated.split_at_mut(read_offset);
+            let previous_row: &[u8] = if write_offset == 0 {
+                &zero_row
+            } else {
+                &front[write_offset - stride..write_offset]
+            };
+            let row = &mut back[..row_len];
+            defilter.defilter_row(divan::black_box(row), previous_row).unwrap();
+            write_offset += stride;
+        }
+    }
+
     /// Build a non-interlaced, 8-bit fixture at `side x side` for
     /// `color_type`/`png_color_type` (the same colour type in both
     /// crates' vocabularies), filtered via the `png` crate's adaptive
@@ -126,14 +154,10 @@ impl FilteredStream {
 #[divan::bench(args = BENCH_SIDES)]
 fn defilter_truecolor(bencher: Bencher, side: u32) {
     let stream = FilteredStream::build(side, ColorType::Truecolor, PngColorType::Rgb);
-    let row_len = 1 + stream.ihdr.stride();
     bencher
         .with_inputs(|| stream.inflated.clone())
         .bench_local_values(|mut inflated| {
-            let mut defilter = Defilter::new(&stream.ihdr);
-            for row in inflated.chunks_mut(row_len) {
-                defilter.defilter_row(divan::black_box(row)).unwrap();
-            }
+            FilteredStream::defilter_all_rows(&stream.ihdr, &mut inflated);
             inflated
         });
 }
@@ -141,14 +165,10 @@ fn defilter_truecolor(bencher: Bencher, side: u32) {
 #[divan::bench(args = BENCH_SIDES)]
 fn defilter_truecolor_alpha(bencher: Bencher, side: u32) {
     let stream = FilteredStream::build(side, ColorType::TruecolorAlpha, PngColorType::Rgba);
-    let row_len = 1 + stream.ihdr.stride();
     bencher
         .with_inputs(|| stream.inflated.clone())
         .bench_local_values(|mut inflated| {
-            let mut defilter = Defilter::new(&stream.ihdr);
-            for row in inflated.chunks_mut(row_len) {
-                defilter.defilter_row(divan::black_box(row)).unwrap();
-            }
+            FilteredStream::defilter_all_rows(&stream.ihdr, &mut inflated);
             inflated
         });
 }
@@ -168,14 +188,10 @@ fn defilter_truecolor_alpha_sub_only(bencher: Bencher, side: u32) {
         PngColorType::Rgba,
         Some(PngFilter::Sub),
     );
-    let row_len = 1 + stream.ihdr.stride();
     bencher
         .with_inputs(|| stream.inflated.clone())
         .bench_local_values(|mut inflated| {
-            let mut defilter = Defilter::new(&stream.ihdr);
-            for row in inflated.chunks_mut(row_len) {
-                defilter.defilter_row(divan::black_box(row)).unwrap();
-            }
+            FilteredStream::defilter_all_rows(&stream.ihdr, &mut inflated);
             inflated
         });
 }
@@ -188,14 +204,10 @@ fn defilter_truecolor_alpha_up_only(bencher: Bencher, side: u32) {
         PngColorType::Rgba,
         Some(PngFilter::Up),
     );
-    let row_len = 1 + stream.ihdr.stride();
     bencher
         .with_inputs(|| stream.inflated.clone())
         .bench_local_values(|mut inflated| {
-            let mut defilter = Defilter::new(&stream.ihdr);
-            for row in inflated.chunks_mut(row_len) {
-                defilter.defilter_row(divan::black_box(row)).unwrap();
-            }
+            FilteredStream::defilter_all_rows(&stream.ihdr, &mut inflated);
             inflated
         });
 }
@@ -208,14 +220,10 @@ fn defilter_truecolor_alpha_average_only(bencher: Bencher, side: u32) {
         PngColorType::Rgba,
         Some(PngFilter::Avg),
     );
-    let row_len = 1 + stream.ihdr.stride();
     bencher
         .with_inputs(|| stream.inflated.clone())
         .bench_local_values(|mut inflated| {
-            let mut defilter = Defilter::new(&stream.ihdr);
-            for row in inflated.chunks_mut(row_len) {
-                defilter.defilter_row(divan::black_box(row)).unwrap();
-            }
+            FilteredStream::defilter_all_rows(&stream.ihdr, &mut inflated);
             inflated
         });
 }
@@ -228,14 +236,10 @@ fn defilter_truecolor_alpha_paeth_only(bencher: Bencher, side: u32) {
         PngColorType::Rgba,
         Some(PngFilter::Paeth),
     );
-    let row_len = 1 + stream.ihdr.stride();
     bencher
         .with_inputs(|| stream.inflated.clone())
         .bench_local_values(|mut inflated| {
-            let mut defilter = Defilter::new(&stream.ihdr);
-            for row in inflated.chunks_mut(row_len) {
-                defilter.defilter_row(divan::black_box(row)).unwrap();
-            }
+            FilteredStream::defilter_all_rows(&stream.ihdr, &mut inflated);
             inflated
         });
 }
@@ -243,14 +247,10 @@ fn defilter_truecolor_alpha_paeth_only(bencher: Bencher, side: u32) {
 #[divan::bench(args = BENCH_SIDES)]
 fn defilter_grayscale(bencher: Bencher, side: u32) {
     let stream = FilteredStream::build(side, ColorType::Grayscale, PngColorType::Grayscale);
-    let row_len = 1 + stream.ihdr.stride();
     bencher
         .with_inputs(|| stream.inflated.clone())
         .bench_local_values(|mut inflated| {
-            let mut defilter = Defilter::new(&stream.ihdr);
-            for row in inflated.chunks_mut(row_len) {
-                defilter.defilter_row(divan::black_box(row)).unwrap();
-            }
+            FilteredStream::defilter_all_rows(&stream.ihdr, &mut inflated);
             inflated
         });
 }

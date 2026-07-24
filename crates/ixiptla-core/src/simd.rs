@@ -598,6 +598,28 @@ impl WrappingPaethScan {
         );
         #[cfg(target_arch = "x86_64")]
         {
+            // SSSE3's `pabsw` and SSE4.1's `pblendvb` turn this loop's
+            // abs/select steps -- baseline-SSE2-emulated multi-instruction
+            // sequences in `scan_suffix_sse2` below -- into single
+            // instructions each, shortening the one-pixel-at-a-time
+            // dependency chain this recurrence is inherently stuck with.
+            // Both extensions have shipped on essentially every x86_64
+            // CPU sold since ~2008 (Nehalem for SSE4.1, its Penryn
+            // predecessor for SSSE3), but unlike SSE2 neither is part of
+            // the `x86_64` baseline ABI, so this -- unlike the SSE2 paths
+            // elsewhere in this module -- needs a real runtime check
+            // (`is_x86_feature_detected!`), same pattern
+            // `crc32_pclmulqdq.rs` uses for PCLMULQDQ. Declining falls
+            // through to the SSE2 path below, never to plain scalar, so
+            // every CPU still gets *some* SIMD speedup for `bpp` 3/4.
+            let accelerated = match bpp {
+                3 => Self::try_scan_suffix_ssse3_sse41::<3>(content, previous_row),
+                4 => Self::try_scan_suffix_ssse3_sse41::<4>(content, previous_row),
+                _ => None,
+            };
+            if accelerated.is_some() {
+                return;
+            }
             match bpp {
                 3 => return Self::scan_suffix_sse2::<3>(content, previous_row),
                 4 => return Self::scan_suffix_sse2::<4>(content, previous_row),
@@ -607,6 +629,27 @@ impl WrappingPaethScan {
         Self::scan_suffix_scalar(content, previous_row, bpp);
     }
 
+    /// Attempts the SSSE3+SSE4.1-accelerated variant of
+    /// [`Self::scan_suffix_sse2`]; `None` means "declined, caller should
+    /// fall back" (missing CPU features), never "ran but failed" -- there
+    /// is no failure mode once dispatched, only a yes/no on whether to
+    /// dispatch at all.
+    #[cfg(target_arch = "x86_64")]
+    fn try_scan_suffix_ssse3_sse41<const BPP: usize>(
+        content: &mut [u8],
+        previous_row: &[u8],
+    ) -> Option<()> {
+        if !std::arch::is_x86_feature_detected!("ssse3")
+            || !std::arch::is_x86_feature_detected!("sse4.1")
+        {
+            return None;
+        }
+        // SAFETY: both feature checks above just confirmed the running
+        // CPU supports every intrinsic `scan_suffix_ssse3_sse41` uses.
+        unsafe { Self::scan_suffix_ssse3_sse41::<BPP>(content, previous_row) };
+        Some(())
+    }
+
     fn scan_suffix_scalar(content: &mut [u8], previous_row: &[u8], bpp: usize) {
         #[allow(clippy::needless_range_loop)]
         for i in bpp..content.len() {
@@ -614,6 +657,71 @@ impl WrappingPaethScan {
             let b = previous_row[i];
             let c = previous_row[i - bpp];
             content[i] = content[i].wrapping_add(Self::paeth_predictor(a, b, c));
+        }
+    }
+
+    /// Same structure as [`Self::scan_suffix_sse2`] (register-carried
+    /// `a`/`c`, i16-lane predictor algebra, `packus` narrowing at the
+    /// end), but the abs/select steps are single real instructions
+    /// (`pabsw`/`pblendvb`) instead of `scan_suffix_sse2`'s baseline-SSE2
+    /// multi-instruction emulation of both.
+    ///
+    /// # Safety
+    ///
+    /// Caller must have already confirmed `ssse3` and `sse4.1` are
+    /// available (see [`Self::try_scan_suffix_ssse3_sse41`]).
+    #[allow(clippy::many_single_char_names)]
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "ssse3", enable = "sse4.1")]
+    unsafe fn scan_suffix_ssse3_sse41<const BPP: usize>(content: &mut [u8], previous_row: &[u8]) {
+        use std::arch::x86_64::{
+            _mm_abs_epi16, _mm_add_epi8, _mm_add_epi16, _mm_blendv_epi8, _mm_cmpeq_epi16,
+            _mm_min_epi16, _mm_packus_epi16, _mm_setzero_si128, _mm_sub_epi16, _mm_unpacklo_epi8,
+        };
+
+        let zero = _mm_setzero_si128();
+        let widen = |v| _mm_unpacklo_epi8(v, zero);
+
+        let mut a = widen(WrappingAverageScan::load_pixel::<BPP>(&content[..BPP]));
+        let mut c = widen(WrappingAverageScan::load_pixel::<BPP>(&previous_row[..BPP]));
+
+        let mut i = BPP;
+        while i + BPP <= content.len() {
+            let b = widen(WrappingAverageScan::load_pixel::<BPP>(
+                &previous_row[i..i + BPP],
+            ));
+            let d = WrappingAverageScan::load_pixel::<BPP>(&content[i..i + BPP]);
+
+            // Same difference-of-differences algebra as `scan_suffix_sse2`
+            // (never materializes p = a+b-c itself), just with `pabsw`
+            // for the abs and `pblendvb` for the select instead of the
+            // hand-rolled equivalents: `pcmpeqw`'s all-1s/all-0s lanes
+            // are already a valid `pblendvb` mask (it reads each byte's
+            // high bit, and an all-1s 16-bit lane has its high bit set in
+            // both halves), so the comparison masks carry over unchanged.
+            let pa = _mm_abs_epi16(_mm_sub_epi16(b, c));
+            let pb = _mm_abs_epi16(_mm_sub_epi16(a, c));
+            let pc = _mm_abs_epi16(_mm_add_epi16(_mm_sub_epi16(b, c), _mm_sub_epi16(a, c)));
+            let smallest = _mm_min_epi16(pc, _mm_min_epi16(pa, pb));
+            let use_a = _mm_cmpeq_epi16(smallest, pa);
+            let use_b = _mm_cmpeq_epi16(smallest, pb);
+            let b_or_c = _mm_blendv_epi8(c, b, use_b);
+            let nearest = _mm_blendv_epi8(b_or_c, a, use_a);
+
+            let recon = _mm_add_epi8(d, _mm_packus_epi16(nearest, nearest));
+            WrappingAverageScan::store_pixel::<BPP>(&mut content[i..i + BPP], recon);
+
+            a = widen(recon);
+            c = b;
+            i += BPP;
+        }
+
+        let _ = (a, c);
+        for j in i..content.len() {
+            let a_byte = content[j - BPP];
+            let b_byte = previous_row[j];
+            let c_byte = previous_row[j - BPP];
+            content[j] = content[j].wrapping_add(Self::paeth_predictor(a_byte, b_byte, c_byte));
         }
     }
 

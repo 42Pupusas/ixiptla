@@ -17,13 +17,48 @@ struct PassGeometry {
 
 /// The 7 fixed `Adam7` pass geometries, spec §8.2 table 8.2.
 const PASS_GEOMETRIES: [PassGeometry; 7] = [
-    PassGeometry { x_start: 0, y_start: 0, x_step: 8, y_step: 8 },
-    PassGeometry { x_start: 4, y_start: 0, x_step: 8, y_step: 8 },
-    PassGeometry { x_start: 0, y_start: 4, x_step: 4, y_step: 8 },
-    PassGeometry { x_start: 2, y_start: 0, x_step: 4, y_step: 4 },
-    PassGeometry { x_start: 0, y_start: 2, x_step: 2, y_step: 4 },
-    PassGeometry { x_start: 1, y_start: 0, x_step: 2, y_step: 2 },
-    PassGeometry { x_start: 0, y_start: 1, x_step: 1, y_step: 2 },
+    PassGeometry {
+        x_start: 0,
+        y_start: 0,
+        x_step: 8,
+        y_step: 8,
+    },
+    PassGeometry {
+        x_start: 4,
+        y_start: 0,
+        x_step: 8,
+        y_step: 8,
+    },
+    PassGeometry {
+        x_start: 0,
+        y_start: 4,
+        x_step: 4,
+        y_step: 8,
+    },
+    PassGeometry {
+        x_start: 2,
+        y_start: 0,
+        x_step: 4,
+        y_step: 4,
+    },
+    PassGeometry {
+        x_start: 0,
+        y_start: 2,
+        x_step: 2,
+        y_step: 4,
+    },
+    PassGeometry {
+        x_start: 1,
+        y_start: 0,
+        x_step: 2,
+        y_step: 2,
+    },
+    PassGeometry {
+        x_start: 0,
+        y_start: 1,
+        x_step: 1,
+        y_step: 2,
+    },
 ];
 
 /// One `Adam7` pass's pixel geometry against a specific full image size.

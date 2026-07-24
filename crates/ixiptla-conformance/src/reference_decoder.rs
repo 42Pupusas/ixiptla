@@ -77,11 +77,18 @@ impl ReferenceComparison {
     /// describes any divergence, including one decoder accepting a file
     /// the other rejects.
     pub fn compare(file: &[u8]) -> Result<(), String> {
-        match (Self::decode_with_png_crate(file), Self::decode_with_ixiptla(file)) {
+        match (
+            Self::decode_with_png_crate(file),
+            Self::decode_with_ixiptla(file),
+        ) {
             (Ok(reference), Ok(ours)) if ours == reference => Ok(()),
             (Ok(_), Ok(_)) => Err("RGBA8 bytes diverge between decoders".to_string()),
-            (Err(e), Ok(_)) => Err(format!("png crate rejected the file but ixiptla_core accepted it: {e}")),
-            (Ok(_), Err(e)) => Err(format!("ixiptla_core rejected the file but the png crate accepted it: {e}")),
+            (Err(e), Ok(_)) => Err(format!(
+                "png crate rejected the file but ixiptla_core accepted it: {e}"
+            )),
+            (Ok(_), Err(e)) => Err(format!(
+                "ixiptla_core rejected the file but the png crate accepted it: {e}"
+            )),
             (Err(png_err), Err(ixiptla_err)) => {
                 // Both reject it -- that's agreement too, just log why in
                 // case the *reasons* diverge in a way worth investigating.

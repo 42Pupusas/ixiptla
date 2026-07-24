@@ -31,7 +31,11 @@ impl<'a> RgbaExpander<'a> {
         palette: Option<&'a Palette>,
         transparency: Option<&'a Transparency>,
     ) -> Self {
-        Self { ihdr, palette, transparency }
+        Self {
+            ihdr,
+            palette,
+            transparency,
+        }
     }
 
     /// Expand `pixels` (as returned by [`crate::Png::decode`]: `height`
@@ -124,7 +128,11 @@ impl<'a> RgbaExpander<'a> {
 
         let mut out = vec![0u8; samples.len() * 4];
         for (chunk, &v) in out.chunks_exact_mut(4).zip(samples) {
-            let a = if transparent_value == Some(u16::from(v)) { 0 } else { 255 };
+            let a = if transparent_value == Some(u16::from(v)) {
+                0
+            } else {
+                255
+            };
             chunk.copy_from_slice(&[v, v, v, a]);
         }
         out
@@ -185,7 +193,11 @@ impl<'a> RgbaExpander<'a> {
                 // tRNS (spec §11.3.2) compares the *raw* sample, at the
                 // image's own bit depth, not the scaled 8-bit output.
                 #[allow(clippy::cast_possible_truncation)]
-                let a = if self.is_transparent_gray(samples[0]) { 0 } else { 255 };
+                let a = if self.is_transparent_gray(samples[0]) {
+                    0
+                } else {
+                    255
+                };
                 [v, v, v, a]
             }
             ColorType::GrayscaleAlpha => {
@@ -218,9 +230,7 @@ impl<'a> RgbaExpander<'a> {
                 #[allow(clippy::cast_possible_truncation)]
                 let index = samples[0] as u8; // index bit depth is always <= 8
                 let [r, g, b] = palette.get(index)?;
-                let a = self
-                    .transparency
-                    .map_or(255, |t| t.alpha_for_index(index));
+                let a = self.transparency.map_or(255, |t| t.alpha_for_index(index));
                 [r, g, b, a]
             }
         })
@@ -231,7 +241,8 @@ impl<'a> RgbaExpander<'a> {
     fn is_transparent_gray(&self, sample: u64) -> bool {
         #[allow(clippy::cast_possible_truncation)] // grayscale samples are always <= 16 bits
         let sample = sample as u16;
-        self.transparency.is_some_and(|t| t.is_transparent_gray(sample))
+        self.transparency
+            .is_some_and(|t| t.is_transparent_gray(sample))
     }
 
     /// Whether raw truecolor `(r, g, b)` (at the image's own bit depth) is
@@ -239,7 +250,8 @@ impl<'a> RgbaExpander<'a> {
     fn is_transparent_rgb(&self, r: u64, g: u64, b: u64) -> bool {
         #[allow(clippy::cast_possible_truncation)] // truecolor samples are always <= 16 bits
         let (r, g, b) = (r as u16, g as u16, b as u16);
-        self.transparency.is_some_and(|t| t.is_transparent_rgb(r, g, b))
+        self.transparency
+            .is_some_and(|t| t.is_transparent_rgb(r, g, b))
     }
 
     /// Scale a `bit_depth`-wide sample up to the full 8-bit range (spec
@@ -485,7 +497,9 @@ mod tests {
         let rgba = expander.expand(&pixels).unwrap();
         assert_eq!(
             rgba,
-            vec![0, 0, 0, 255, 10, 10, 10, 255, 20, 20, 20, 255, 30, 30, 30, 255]
+            vec![
+                0, 0, 0, 255, 10, 10, 10, 255, 20, 20, 20, 255, 30, 30, 30, 255
+            ]
         );
     }
 

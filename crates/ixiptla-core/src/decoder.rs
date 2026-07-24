@@ -89,7 +89,12 @@ impl Png {
             InterlaceMethod::Adam7 => Self::defilter_adam7(&ihdr, &inflated)?,
         };
 
-        Ok(Self { ihdr, pixels, palette, transparency })
+        Ok(Self {
+            ihdr,
+            pixels,
+            palette,
+            transparency,
+        })
     }
 
     /// Defilter a non-interlaced `IDAT` stream: one flat sequence of
@@ -236,7 +241,10 @@ pub enum DecodeError {
     TruncatedImageData,
     /// The inflated data decoded to a different number of scanlines than
     /// `IHDR.height` promised.
-    RowCountMismatch { expected: usize, actual: usize },
+    RowCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
     Zlib(ixchel::ZlibError),
     Filter(InvalidFilterType),
 }
@@ -417,7 +425,13 @@ mod tests {
         file.extend(encode_chunk(*b"IEND", b""));
 
         let err = Png::decode(&file, 1 << 20).unwrap_err();
-        assert!(matches!(err, DecodeError::RowCountMismatch { expected: 3, actual: 2 }));
+        assert!(matches!(
+            err,
+            DecodeError::RowCountMismatch {
+                expected: 3,
+                actual: 2
+            }
+        ));
     }
 
     #[test]
@@ -484,15 +498,21 @@ mod tests {
         let pass1 = vec![0u8, 42]; // 1x1: filter byte + 1 content byte
         let pass6 = vec![0u8, 7]; // 1x1: filter byte + 1 content byte
         let pass7 = vec![0u8, 99, 100]; // 2x1: filter byte + 2 content bytes
-        let file = build_adam7_png(2, 2, 0, 8, &[
-            pass1,
-            vec![], // pass 2: empty
-            vec![], // pass 3: empty
-            vec![], // pass 4: empty
-            vec![], // pass 5: empty
-            pass6,
-            pass7,
-        ]);
+        let file = build_adam7_png(
+            2,
+            2,
+            0,
+            8,
+            &[
+                pass1,
+                vec![], // pass 2: empty
+                vec![], // pass 3: empty
+                vec![], // pass 4: empty
+                vec![], // pass 5: empty
+                pass6,
+                pass7,
+            ],
+        );
 
         let png = Png::decode(&file, 1 << 20).unwrap();
         assert_eq!(png.pixels, vec![42, 7, 99, 100]);

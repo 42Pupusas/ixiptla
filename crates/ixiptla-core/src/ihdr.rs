@@ -124,7 +124,10 @@ pub enum IhdrError {
     /// The color type byte wasn't one of the five PNG defines.
     InvalidColorType(InvalidColorType),
     /// This bit depth isn't legal for this color type (spec table 11.1).
-    InvalidBitDepth { bit_depth: u8, color_type: ColorType },
+    InvalidBitDepth {
+        bit_depth: u8,
+        color_type: ColorType,
+    },
     /// Compression method byte wasn't 0 (the only value the spec defines).
     InvalidCompressionMethod(u8),
     /// Filter method byte wasn't 0 (the only value the spec defines).
@@ -150,7 +153,10 @@ impl core::fmt::Display for IhdrError {
             Self::InvalidBitDepth {
                 bit_depth,
                 color_type,
-            } => write!(f, "bit depth {bit_depth} is not valid for color type {color_type:?}"),
+            } => write!(
+                f,
+                "bit depth {bit_depth} is not valid for color type {color_type:?}"
+            ),
             Self::InvalidCompressionMethod(m) => write!(f, "invalid compression method: {m}"),
             Self::InvalidFilterMethod(m) => write!(f, "invalid filter method: {m}"),
             Self::InvalidInterlaceMethod(m) => write!(f, "invalid interlace method: {m}"),
@@ -162,7 +168,7 @@ impl std::error::Error for IhdrError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{ColorType, IhdrError, InterlaceMethod, Ihdr};
+    use super::{ColorType, Ihdr, IhdrError, InterlaceMethod};
 
     fn encode_ihdr(
         width: u32,

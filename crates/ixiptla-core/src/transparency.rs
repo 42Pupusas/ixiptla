@@ -150,9 +150,15 @@ mod tests {
     #[test]
     fn rejects_alpha_color_types() {
         let err = Transparency::parse(ColorType::GrayscaleAlpha, &[0, 0]).unwrap_err();
-        assert!(matches!(err, TransparencyError::NotApplicable(ColorType::GrayscaleAlpha)));
+        assert!(matches!(
+            err,
+            TransparencyError::NotApplicable(ColorType::GrayscaleAlpha)
+        ));
         let err = Transparency::parse(ColorType::TruecolorAlpha, &[0, 0]).unwrap_err();
-        assert!(matches!(err, TransparencyError::NotApplicable(ColorType::TruecolorAlpha)));
+        assert!(matches!(
+            err,
+            TransparencyError::NotApplicable(ColorType::TruecolorAlpha)
+        ));
     }
 
     #[test]

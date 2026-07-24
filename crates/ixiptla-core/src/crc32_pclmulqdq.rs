@@ -188,17 +188,10 @@ impl Pclmulqdq {
             // `crc32fast`'s own source comment on this exact point) --
             // algebraically: x = (x[0:63]*K4) ^ x[64:127], then x =
             // ((x[0:31] as u64)*K5) ^ x[32:95].
-            let x = _mm_xor_si128(
-                _mm_clmulepi64_si128(x, k3k4, 0x10),
-                _mm_srli_si128(x, 8),
-            );
+            let x = _mm_xor_si128(_mm_clmulepi64_si128(x, k3k4, 0x10), _mm_srli_si128(x, 8));
             let low32_mask = _mm_set_epi32(0, 0, 0, !0);
             let x = _mm_xor_si128(
-                _mm_clmulepi64_si128(
-                    _mm_and_si128(x, low32_mask),
-                    _mm_set_epi64x(0, K5),
-                    0x00,
-                ),
+                _mm_clmulepi64_si128(_mm_and_si128(x, low32_mask), _mm_set_epi64x(0, K5), 0x00),
                 _mm_srli_si128(x, 4),
             );
 

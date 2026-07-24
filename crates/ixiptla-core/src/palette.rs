@@ -81,7 +81,10 @@ impl core::fmt::Display for PaletteError {
             }
             Self::TooManyEntries(n) => write!(f, "PLTE has {n} entries, more than the max 256"),
             Self::IndexOutOfRange { index, len } => {
-                write!(f, "palette index {index} is out of range for a {len}-entry palette")
+                write!(
+                    f,
+                    "palette index {index} is out of range for a {len}-entry palette"
+                )
             }
         }
     }

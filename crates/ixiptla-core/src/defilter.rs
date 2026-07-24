@@ -1,6 +1,5 @@
 use crate::simd::{
-    WrappingAverageScan, WrappingByteAdder, WrappingLaneScan, WrappingPaethScan,
-    WrappingPrefixSum,
+    WrappingAverageScan, WrappingByteAdder, WrappingLaneScan, WrappingPaethScan, WrappingPrefixSum,
 };
 use crate::{FilterType, Ihdr, InvalidFilterType};
 

@@ -134,12 +134,7 @@ mod tests {
     /// is set) expect: pass 1's rows top-to-bottom, then pass 2's, ...,
     /// pass 7's — each pass being its own tiny sub-sampled image (spec
     /// §8.2), not the full-size raster.
-    fn random_raw_adam7(
-        width: u32,
-        height: u32,
-        bytes_per_sample: usize,
-        seed: u32,
-    ) -> Vec<u8> {
+    fn random_raw_adam7(width: u32, height: u32, bytes_per_sample: usize, seed: u32) -> Vec<u8> {
         let mut src = PixelSource::new(seed);
         let mut out = Vec::new();
         for (x_sampling, x_offset, y_sampling, y_offset) in ADAM7_PASS_CONSTANTS {

@@ -183,7 +183,8 @@ impl WrappingPrefixSum {
                 // `pshufb`, SSSE3+, one step above this baseline).
                 let mut last = [0u8; 16];
                 _mm_storeu_si128(last.as_mut_ptr().cast(), x);
-                #[allow(clippy::cast_possible_wrap)] // bit pattern only: paddb doesn't care about signedness.
+                #[allow(clippy::cast_possible_wrap)]
+                // bit pattern only: paddb doesn't care about signedness.
                 let carry_byte = last[15] as i8;
                 carry = _mm_set1_epi8(carry_byte);
             }
@@ -393,7 +394,7 @@ impl WrappingLaneScan {
 /// reconstructed, same row) and `b` is the byte directly above (the
 /// previous row, entirely already known).
 ///
-/// # Why this stays scalar
+/// # Why the general case stays scalar, but `bpp` 3/4 don't
 ///
 /// An earlier version of this struct vectorized the per-pixel `avg(a, b)`
 /// computation with SSE2's `pavgb`, loading each pixel's `bpp` (<=8) bytes
@@ -401,19 +402,21 @@ impl WrappingLaneScan {
 /// and storing back out through another stack buffer. Benchmarked against
 /// `ixiptla-bench`'s isolated `defilter_truecolor_alpha_average_only` case
 /// at 1024px, that version was *consistently slower* than a plain scalar
-/// loop (~13ms vs ~3.7ms median) -- the load/store round-trip for a
-/// register that's using at most 8 of its 16 lanes, once per *single
-/// pixel* (this recurrence is inherently one-pixel-at-a-time -- `a`
-/// depends on the immediately preceding pixel), costs far more than the
-/// handful of scalar ALU ops it replaces. `Sub`/`Up`'s SIMD wins work
-/// because they either batch many pixels per register (`Sub`, via
-/// `WrappingLaneScan`) or have no per-row sequential dependency at all
-/// (`Up`). `Average` has neither: it's genuinely one pixel per step, and
-/// at `bpp <= 8` a pixel is too narrow to amortize a 128-bit load/store.
-/// So this is deliberately the plain scalar loop, kept as its own struct
-/// (rather than inlined into `Defilter`) purely for symmetry with the
-/// other `Wrapping*` scan types and to keep `defilter.rs` itself free of
-/// the loop body.
+/// loop (~13ms vs ~3.7ms median) -- the load/store round-trip through a
+/// stack buffer, once per *single pixel* (this recurrence is inherently
+/// one-pixel-at-a-time -- `a` depends on the immediately preceding pixel),
+/// costs far more than the handful of scalar ALU ops it replaces.
+///
+/// libpng's own `intel/filter_sse2_intrinsics.c` solves this differently:
+/// instead of a memory round-trip, it moves each pixel directly between a
+/// GPR and the low 32 bits of an XMM register via `_mm_cvtsi32_si128`/
+/// `_mm_cvtsi128_si32` -- no stack buffer at all -- and carries `a`
+/// (the previous iteration's reconstructed pixel) forward *as a register*
+/// rather than re-reading it from memory. Ported here for `bpp` in
+/// `{3, 4}` (8-bit RGB/RGBA -- by far the most common real-world PNGs);
+/// other `bpp` values (1/2/6/8: grayscale, 16-bit variants) keep the plain
+/// scalar loop, both because they're rarer and because narrower/wider
+/// pixels don't fit this exact 32-bit-lane trick as cleanly.
 #[derive(Debug)]
 pub struct WrappingAverageScan;
 
@@ -433,6 +436,18 @@ impl WrappingAverageScan {
             previous_row.len(),
             "scan_suffix: length mismatch"
         );
+        #[cfg(target_arch = "x86_64")]
+        {
+            match bpp {
+                3 => return Self::scan_suffix_sse2::<3>(content, previous_row),
+                4 => return Self::scan_suffix_sse2::<4>(content, previous_row),
+                _ => {}
+            }
+        }
+        Self::scan_suffix_scalar(content, previous_row, bpp);
+    }
+
+    fn scan_suffix_scalar(content: &mut [u8], previous_row: &[u8], bpp: usize) {
         #[allow(clippy::needless_range_loop)]
         for i in bpp..content.len() {
             let a = content[i - bpp];
@@ -446,12 +461,101 @@ impl WrappingAverageScan {
             content[i] = content[i].wrapping_add(avg);
         }
     }
+
+    /// libpng-style register-carrying SSE2 loop for `BPP` in `{3, 4}`:
+    /// each 32-bit lane group holds one whole pixel (`BPP` real bytes,
+    /// zero-padded up to 4 in the `BPP == 3` case -- the padding lane's
+    /// garbage never gets written back, so it's harmless). `a` (the
+    /// previous iteration's reconstructed pixel) is carried forward as a
+    /// register across iterations instead of being re-read from memory,
+    /// which is what makes this different from -- and much cheaper than
+    /// -- the earlier stack-buffer-per-pixel attempt this replaces.
+    #[cfg(target_arch = "x86_64")]
+    fn scan_suffix_sse2<const BPP: usize>(content: &mut [u8], previous_row: &[u8]) {
+        use std::arch::x86_64::{
+            _mm_add_epi8, _mm_and_si128, _mm_avg_epu8, _mm_set1_epi8, _mm_sub_epi8, _mm_xor_si128,
+        };
+
+        // `a` starts as the already-reconstructed pixel at `content[0..BPP]`
+        // (the caller's prefix handling put it there before this suffix
+        // scan begins), packed into a 32-bit lane the same way every
+        // subsequent `d` will be.
+        let mut a = Self::load_pixel::<BPP>(&content[..BPP]);
+
+        let mut i = BPP;
+        while i + BPP <= content.len() {
+            let b = Self::load_pixel::<BPP>(&previous_row[i..i + BPP]);
+            let mut d = Self::load_pixel::<BPP>(&content[i..i + BPP]);
+
+            // `_mm_avg_epu8` computes a *rounding* average ((a+b+1)>>1),
+            // but PNG's spec defines Average as a *truncating* one
+            // (floor((a+b)/2)). Those agree whenever a+b is even; when
+            // a+b is odd, pavgb rounds up by exactly 1 too many, so
+            // subtract 1 back off precisely when a and b have different
+            // parity (`(a^b) & 1`) -- same fixup libpng's own
+            // `png_read_filter_row_avg{3,4}_sse2` uses.
+            let avg = unsafe {
+                let avg = _mm_avg_epu8(a, b);
+                _mm_sub_epi8(avg, _mm_and_si128(_mm_xor_si128(a, b), _mm_set1_epi8(1)))
+            };
+            d = unsafe { _mm_add_epi8(d, avg) };
+
+            Self::store_pixel::<BPP>(&mut content[i..i + BPP], d);
+            a = d;
+            i += BPP;
+        }
+
+        // Scalar tail: a real IDAT stream's rows are always a whole number
+        // of pixels wide, so this never actually triggers in practice --
+        // but the SIMD loop above stops as soon as a full BPP-byte pixel
+        // no longer fits, so any leftover partial-pixel remainder (or a
+        // caller-supplied length that just isn't pixel-aligned, as the
+        // unit tests below deliberately exercise) still needs *some*
+        // handling to stay correct rather than silently dropping bytes.
+        // `a`'s low BPP bytes are already the last fully-reconstructed
+        // pixel (or the caller's own prefix pixel, if the loop above never
+        // ran), so unpacking it back out picks up the running byte-at-a-
+        // time reconstruction exactly where the SIMD loop left off.
+        let _ = a; // superseded by direct indexing in this tail.
+        for j in i..content.len() {
+            let a_byte = content[j - BPP];
+            let b_byte = previous_row[j];
+            let avg = u16::midpoint(u16::from(a_byte), u16::from(b_byte));
+            #[allow(clippy::cast_possible_truncation)]
+            let avg = avg as u8;
+            content[j] = content[j].wrapping_add(avg);
+        }
+    }
+
+    /// Packs `BPP` (3 or 4) bytes from `bytes` into the low lane(s) of an
+    /// `__m128i`, zero-padded up to 4 bytes for `BPP == 3` -- safe (no
+    /// out-of-bounds read) since it only ever reads exactly `bytes.len()`
+    /// bytes via a small stack-local buffer, unlike libpng's C version
+    /// which deliberately over-reads 1 byte past a 3-byte pixel for
+    /// speed.
+    #[cfg(target_arch = "x86_64")]
+    fn load_pixel<const BPP: usize>(bytes: &[u8]) -> std::arch::x86_64::__m128i {
+        use std::arch::x86_64::_mm_cvtsi32_si128;
+        let mut buf = [0u8; 4];
+        buf[..BPP].copy_from_slice(bytes);
+        unsafe { _mm_cvtsi32_si128(i32::from_ne_bytes(buf)) }
+    }
+
+    /// Inverse of [`Self::load_pixel`]: writes back only the first `BPP`
+    /// bytes of `v`'s low 32 bits into `bytes`, discarding the zero-padded
+    /// 4th lane when `BPP == 3`.
+    #[cfg(target_arch = "x86_64")]
+    fn store_pixel<const BPP: usize>(bytes: &mut [u8], v: std::arch::x86_64::__m128i) {
+        use std::arch::x86_64::_mm_cvtsi128_si32;
+        let packed = unsafe { _mm_cvtsi128_si32(v) };
+        bytes.copy_from_slice(&packed.to_ne_bytes()[..BPP]);
+    }
 }
 
 /// `Paeth` filter reconstruction: `Recon(x) = Filt(x) + PaethPredictor(
 /// Recon(a), Recon(b), Recon(c))`.
 ///
-/// # Why this stays scalar
+/// # Why the general case stays scalar, but `bpp` 3/4 don't
 ///
 /// Same finding as [`WrappingAverageScan`], more pronounced: an earlier
 /// SSE2 version (zero-extending each pixel's `bpp` bytes into `i16`
@@ -459,13 +563,20 @@ impl WrappingAverageScan {
 /// packing back to `u8`, all through on-stack load/store buffers per
 /// single pixel) benchmarked *slower* than the plain scalar loop on
 /// `defilter_truecolor_alpha_paeth_only` at 1024px (~16.5ms vs ~14.2ms
-/// median) -- `Paeth`'s recurrence is one pixel per step just like
-/// `Average`, so the same narrow-register load/store tax applies, and
-/// `Paeth`'s predictor needs *more* instructions per register op (3-way
-/// abs+compare+blend against baseline SSE2's missing pieces: no `pabsw`,
-/// no `pblendvb`) than `Average`'s single `pavgb`, making the tradeoff
-/// even worse. Kept as its own struct for the same symmetry/SRP reasons
-/// as `WrappingAverageScan`.
+/// median) -- the memory round-trip through a stack buffer dominates,
+/// same root cause as `WrappingAverageScan`'s original attempt.
+///
+/// Ported here (for `bpp` in `{3, 4}` only, same reasoning as
+/// `WrappingAverageScan`) following libpng's `intel/
+/// filter_sse2_intrinsics.c` `png_read_filter_row_paeth{3,4}_sse2`: `a`,
+/// `b`, `c` all move directly between a GPR and an XMM register's low 32
+/// bits (`_mm_cvtsi32_si128`/`_mm_cvtsi128_si32`, via
+/// [`WrappingAverageScan::load_pixel`]/`store_pixel`, reused here) with no
+/// stack buffer, then get zero-extended to `i16` lanes (`bpp <= 4` bytes
+/// always fit in the low 4 of a register's 8 `i16` lanes) so the
+/// predictor's subtraction/abs/compare can't overflow `i8`. `b` and `c`
+/// carry forward as registers across iterations exactly like `a` does in
+/// `WrappingAverageScan` -- `c` is simply last iteration's `b`.
 #[derive(Debug)]
 pub struct WrappingPaethScan;
 
@@ -485,6 +596,18 @@ impl WrappingPaethScan {
             previous_row.len(),
             "scan_suffix: length mismatch"
         );
+        #[cfg(target_arch = "x86_64")]
+        {
+            match bpp {
+                3 => return Self::scan_suffix_sse2::<3>(content, previous_row),
+                4 => return Self::scan_suffix_sse2::<4>(content, previous_row),
+                _ => {}
+            }
+        }
+        Self::scan_suffix_scalar(content, previous_row, bpp);
+    }
+
+    fn scan_suffix_scalar(content: &mut [u8], previous_row: &[u8], bpp: usize) {
         #[allow(clippy::needless_range_loop)]
         for i in bpp..content.len() {
             let a = content[i - bpp];
@@ -492,6 +615,139 @@ impl WrappingPaethScan {
             let c = previous_row[i - bpp];
             content[i] = content[i].wrapping_add(Self::paeth_predictor(a, b, c));
         }
+    }
+
+    /// libpng-style register-carrying SSE2 loop for `BPP` in `{3, 4}`,
+    /// mirroring [`WrappingAverageScan::scan_suffix_sse2`]'s structure.
+    /// Works in zero-extended `i16` lanes throughout (`_mm_sub_epi16`/
+    /// `abs`/`_mm_min_epi16`/compare all need signed headroom the raw
+    /// `u8` values don't have -- `p - a` etc. can be negative or exceed
+    /// `i8::MAX`), then narrows back to `u8` via `_mm_packus_epi16` only
+    /// at the very end, right before storing.
+    // Single-letter names (a/b/c/d) deliberately mirror the PNG spec's own
+    // Paeth notation (spec 9.4's a/b/c/x/d neighbor naming) rather than
+    // more verbose alternatives -- keeping the code's variable names
+    // identical to the spec text it implements is worth more here than
+    // satisfying this particular style lint.
+    #[allow(clippy::many_single_char_names)]
+    #[cfg(target_arch = "x86_64")]
+    fn scan_suffix_sse2<const BPP: usize>(content: &mut [u8], previous_row: &[u8]) {
+        use std::arch::x86_64::{
+            _mm_add_epi8, _mm_cmpeq_epi16, _mm_min_epi16, _mm_packus_epi16, _mm_setzero_si128,
+            _mm_sub_epi16, _mm_unpacklo_epi8,
+        };
+
+        let zero = unsafe { _mm_setzero_si128() };
+        // Widen a packed-pixel __m128i (low BPP bytes meaningful, rest
+        // zero) to i16 lanes -- needed before any subtraction/abs/compare
+        // below, since those can go negative or exceed i8::MAX/u8::MAX.
+        let widen = |v| unsafe { _mm_unpacklo_epi8(v, zero) };
+
+        // First iteration's a/c are both the all-zero "no left neighbor,
+        // no upper-left neighbor" case (the caller's prefix loop already
+        // handled bpp..content.len()'s i==bpp..2*bpp boundary condition
+        // for us by writing content[..BPP] as plain `+= above`, so this
+        // starts from content[BPP..] with a real `a`).
+        let mut a = widen(WrappingAverageScan::load_pixel::<BPP>(&content[..BPP]));
+        let mut c = widen(WrappingAverageScan::load_pixel::<BPP>(&previous_row[..BPP]));
+
+        let mut i = BPP;
+        while i + BPP <= content.len() {
+            let b = widen(WrappingAverageScan::load_pixel::<BPP>(
+                &previous_row[i..i + BPP],
+            ));
+            let d = WrappingAverageScan::load_pixel::<BPP>(&content[i..i + BPP]);
+
+            // Paeth predictor algebra, entirely in terms of differences
+            // (avoids ever materializing p = a+b-c itself, same
+            // simplification libpng's C uses):
+            //   p - a == b - c
+            //   p - b == a - c
+            //   p - c == (b-c) + (a-c)
+            let (nearest, pa, pb, pc) = unsafe {
+                let pa = _mm_sub_epi16(b, c);
+                let pb = _mm_sub_epi16(a, c);
+                let pc = Self::add_epi16(pa, pb);
+                let (pa, pb, pc) = (
+                    Self::abs_epi16(pa),
+                    Self::abs_epi16(pb),
+                    Self::abs_epi16(pc),
+                );
+                let smallest = _mm_min_epi16(pc, _mm_min_epi16(pa, pb));
+                // Ties favour a, then b, then c -- matches the scalar
+                // predictor's `pa <= pb && pa <= pc` / `pb <= pc` order.
+                let use_a = _mm_cmpeq_epi16(smallest, pa);
+                let use_b = _mm_cmpeq_epi16(smallest, pb);
+                let b_or_c = Self::select_epi16(use_b, b, c);
+                (Self::select_epi16(use_a, a, b_or_c), pa, pb, pc)
+            };
+            let _ = (pa, pb, pc); // consumed above; named only for the doc comment's algebra trail.
+
+            let recon = unsafe { _mm_add_epi8(d, _mm_packus_epi16(nearest, nearest)) };
+            WrappingAverageScan::store_pixel::<BPP>(&mut content[i..i + BPP], recon);
+
+            // Next iteration's a/c are this iteration's reconstructed
+            // pixel / this iteration's b -- carried as registers, no
+            // re-read from memory.
+            a = widen(recon);
+            c = b;
+            i += BPP;
+        }
+
+        // Scalar tail: a real IDAT stream is always pixel-aligned, but any
+        // leftover partial pixel (or a non-pixel-aligned length the unit
+        // tests deliberately exercise) still needs correct handling.
+        // Plain indexing rather than the a/c registers above:
+        // content[j - BPP]/previous_row[j - BPP] are already fully
+        // reconstructed (either by the SIMD loop or by the caller's own
+        // prefix step), exactly the same source `scan_suffix_scalar` reads
+        // from.
+        let _ = (a, c); // superseded by direct indexing in this tail.
+        for j in i..content.len() {
+            let a_byte = content[j - BPP];
+            let b_byte = previous_row[j];
+            let c_byte = previous_row[j - BPP];
+            content[j] = content[j].wrapping_add(Self::paeth_predictor(a_byte, b_byte, c_byte));
+        }
+    }
+
+    /// `_mm_add_epi16` by another name -- broken out only so the doc
+    /// comment above can narrate `pc`'s derivation as a named step.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn add_epi16(
+        x: std::arch::x86_64::__m128i,
+        y: std::arch::x86_64::__m128i,
+    ) -> std::arch::x86_64::__m128i {
+        unsafe { std::arch::x86_64::_mm_add_epi16(x, y) }
+    }
+
+    /// `|x|` for `i16` lanes. Baseline SSE2 has no `pabsw` (that's SSSE3),
+    /// so this is the two's-complement identity `x < 0 ? -x : x`: XOR
+    /// every negative lane's bits (flips them, i.e. one's-complement
+    /// negation), then add 1 to just the lanes that were negative --
+    /// exactly libpng's own `abs_i16` SSE2 fallback.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn abs_epi16(x: std::arch::x86_64::__m128i) -> std::arch::x86_64::__m128i {
+        use std::arch::x86_64::{_mm_cmplt_epi16, _mm_setzero_si128, _mm_sub_epi16, _mm_xor_si128};
+        unsafe {
+            let is_negative = _mm_cmplt_epi16(x, _mm_setzero_si128());
+            let flipped = _mm_xor_si128(x, is_negative);
+            _mm_sub_epi16(flipped, is_negative)
+        }
+    }
+
+    /// Bytewise/lanewise `mask ? t : e`, for a `mask` that's already an
+    /// all-1s/all-0s comparison result (as `_mm_cmpeq_epi16` produces).
+    /// Baseline SSE2 has no `pblendvb` (that's SSE4.1), so this is the
+    /// classic bitmask blend: `(mask & t) | (!mask & e)`.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn select_epi16(
+        mask: std::arch::x86_64::__m128i,
+        t: std::arch::x86_64::__m128i,
+        e: std::arch::x86_64::__m128i,
+    ) -> std::arch::x86_64::__m128i {
+        use std::arch::x86_64::{_mm_and_si128, _mm_andnot_si128, _mm_or_si128};
+        unsafe { _mm_or_si128(_mm_and_si128(mask, t), _mm_andnot_si128(mask, e)) }
     }
 
     /// Spec §9.4's Paeth predictor: picks whichever of the left/above/
@@ -514,10 +770,12 @@ impl WrappingPaethScan {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::{WrappingAverageScan, WrappingByteAdder, WrappingLaneScan, WrappingPaethScan, WrappingPrefixSum};
+    use super::{
+        WrappingAverageScan, WrappingByteAdder, WrappingLaneScan, WrappingPaethScan,
+        WrappingPrefixSum,
+    };
 
     #[test]
     fn matches_scalar_wrapping_add_elementwise() {
@@ -588,7 +846,9 @@ mod tests {
         // exercised.
         for len in [0, 1, 15, 16, 17, 31, 32, 33, 47, 48, 63, 100, 257] {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let data: Vec<u8> = (0..len as u32).map(|n| ((n * 37 + 5) % 256) as u8).collect();
+            let data: Vec<u8> = (0..len as u32)
+                .map(|n| ((n * 37 + 5) % 256) as u8)
+                .collect();
             let expected = scalar_prefix_sum(&data);
             let mut actual = data.clone();
             WrappingPrefixSum::scan(&mut actual);
@@ -640,7 +900,9 @@ mod tests {
         for bpp in [2usize, 3, 4, 6, 8] {
             for len in [0usize, 1, bpp, bpp * 2, 15, 16, 17, 31, 32, 33, 100, 251] {
                 #[allow(clippy::cast_possible_truncation)]
-                let data: Vec<u8> = (0..len as u32).map(|n| ((n * 41 + 13) % 256) as u8).collect();
+                let data: Vec<u8> = (0..len as u32)
+                    .map(|n| ((n * 41 + 13) % 256) as u8)
+                    .collect();
                 let expected = scalar_lane_scan(&data, bpp);
                 let mut actual = data.clone();
                 WrappingLaneScan::scan(&mut actual, bpp);
@@ -705,9 +967,13 @@ mod tests {
                     continue;
                 }
                 #[allow(clippy::cast_possible_truncation)]
-                let content: Vec<u8> = (0..len as u32).map(|n| ((n * 29 + 7) % 256) as u8).collect();
+                let content: Vec<u8> = (0..len as u32)
+                    .map(|n| ((n * 29 + 7) % 256) as u8)
+                    .collect();
                 #[allow(clippy::cast_possible_truncation)]
-                let previous_row: Vec<u8> = (0..len as u32).map(|n| ((n * 53 + 11) % 256) as u8).collect();
+                let previous_row: Vec<u8> = (0..len as u32)
+                    .map(|n| ((n * 53 + 11) % 256) as u8)
+                    .collect();
                 let expected = scalar_average_suffix(&content, &previous_row, bpp);
                 let mut actual = content.clone();
                 WrappingAverageScan::scan_suffix(&mut actual, &previous_row, bpp);
@@ -767,9 +1033,13 @@ mod tests {
                     continue;
                 }
                 #[allow(clippy::cast_possible_truncation)]
-                let content: Vec<u8> = (0..len as u32).map(|n| ((n * 71 + 3) % 256) as u8).collect();
+                let content: Vec<u8> = (0..len as u32)
+                    .map(|n| ((n * 71 + 3) % 256) as u8)
+                    .collect();
                 #[allow(clippy::cast_possible_truncation)]
-                let previous_row: Vec<u8> = (0..len as u32).map(|n| ((n * 97 + 17) % 256) as u8).collect();
+                let previous_row: Vec<u8> = (0..len as u32)
+                    .map(|n| ((n * 97 + 17) % 256) as u8)
+                    .collect();
                 let expected = scalar_paeth_suffix(&content, &previous_row, bpp);
                 let mut actual = content.clone();
                 WrappingPaethScan::scan_suffix(&mut actual, &previous_row, bpp);

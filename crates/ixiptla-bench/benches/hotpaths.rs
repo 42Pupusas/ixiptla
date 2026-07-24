@@ -17,7 +17,7 @@
 //! vs. "more allocator churn" without a separate profiling pass.
 
 use divan::Bencher;
-use ixiptla_bench::fixtures::{SquareFixture, BENCH_SIDES};
+use ixiptla_bench::fixtures::{BENCH_SIDES, SquareFixture};
 use ixiptla_core::{ColorType, Defilter, Ihdr, InterlaceMethod, Png, RgbaExpander};
 use png::ColorType as PngColorType;
 use png::Filter as PngFilter;

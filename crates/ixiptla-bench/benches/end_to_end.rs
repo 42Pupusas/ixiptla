@@ -19,7 +19,7 @@
 
 use divan::Bencher;
 use image::ImageDecoder as _;
-use ixiptla_bench::fixtures::{SquareFixture, BENCH_SIDES};
+use ixiptla_bench::fixtures::{BENCH_SIDES, SquareFixture};
 use ixiptla_core::{Png, RgbaExpander};
 use png::{ColorType as PngColorType, Transformations};
 use std::io::Cursor;
@@ -45,7 +45,11 @@ fn ixiptla_truecolor_alpha(bencher: Bencher, side: u32) {
     bencher.bench_local(|| {
         let file = divan::black_box(&file);
         let decoded = Png::decode(file, 1 << 24).unwrap();
-        let expander = RgbaExpander::new(&decoded.ihdr, decoded.palette.as_ref(), decoded.transparency.as_ref());
+        let expander = RgbaExpander::new(
+            &decoded.ihdr,
+            decoded.palette.as_ref(),
+            decoded.transparency.as_ref(),
+        );
         expander.expand(&decoded.pixels).unwrap()
     });
 }
@@ -97,7 +101,11 @@ fn ixiptla_grayscale(bencher: Bencher, side: u32) {
     bencher.bench_local(|| {
         let file = divan::black_box(&file);
         let decoded = Png::decode(file, 1 << 24).unwrap();
-        let expander = RgbaExpander::new(&decoded.ihdr, decoded.palette.as_ref(), decoded.transparency.as_ref());
+        let expander = RgbaExpander::new(
+            &decoded.ihdr,
+            decoded.palette.as_ref(),
+            decoded.transparency.as_ref(),
+        );
         expander.expand(&decoded.pixels).unwrap()
     });
 }

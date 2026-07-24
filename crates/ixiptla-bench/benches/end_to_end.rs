@@ -127,8 +127,18 @@ fn png_crate_grayscale(bencher: Bencher, side: u32) {
     });
 }
 
+/// **Not** a fair comparison to `ixiptla_grayscale`/`png_crate_grayscale`
+/// above: `image`'s `PngDecoder::color_type()` (and hence `total_bytes`/
+/// `read_image`) reports the PNG's *native* colour type -- `L8` (1 byte/
+/// pixel) for a `Grayscale` source -- rather than forcing an RGBA8
+/// expansion the way `ixiptla_grayscale` and `png_crate_grayscale`'s
+/// explicit `Transformations::EXPAND | ALPHA` both do. Left in (renamed
+/// to say so) purely as a "how fast is `image`'s own preferred/native
+/// decode path" data point; `image_crate_grayscale_to_rgba8` below is
+/// the actual apples-to-apples one, doing the same `L8 -> RGBA8` fan-out
+/// this crate's `RgbaExpander` does, via `DynamicImage::into_rgba8`.
 #[divan::bench(args = BENCH_SIDES)]
-fn image_crate_grayscale(bencher: Bencher, side: u32) {
+fn image_crate_grayscale_native_l8(bencher: Bencher, side: u32) {
     let file = SquareFixture::new(side, PngColorType::Grayscale).encode();
     bencher.bench_local(|| {
         let file = divan::black_box(&file);
@@ -136,5 +146,22 @@ fn image_crate_grayscale(bencher: Bencher, side: u32) {
         let mut buf = vec![0u8; usize::try_from(decoder.total_bytes()).unwrap()];
         decoder.read_image(&mut buf).unwrap();
         buf
+    });
+}
+
+/// The actual apples-to-apples grayscale comparison: `image`'s own
+/// `L8 -> RGBA8` expansion (`DynamicImage::into_rgba8`), so this does the
+/// same amount of output work (`width * height * 4` bytes) as
+/// `ixiptla_grayscale` and `png_crate_grayscale` above --
+/// `image_crate_grayscale_native_l8` above instead stops at `image`'s
+/// native `L8`, 4x less output, which made it look implausibly fast
+/// next to the other two decoders.
+#[divan::bench(args = BENCH_SIDES)]
+fn image_crate_grayscale_to_rgba8(bencher: Bencher, side: u32) {
+    let file = SquareFixture::new(side, PngColorType::Grayscale).encode();
+    bencher.bench_local(|| {
+        let file = divan::black_box(&file);
+        let img = image::load_from_memory(file).unwrap();
+        img.into_rgba8().into_raw()
     });
 }

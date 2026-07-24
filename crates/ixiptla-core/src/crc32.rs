@@ -75,12 +75,36 @@ impl Crc32 {
 
     /// Fold more bytes into the running CRC.
     ///
-    /// Processes 8-byte chunks via the slicing-by-8 combine step, then
-    /// finishes any `< 8`-byte remainder with the plain single-byte table
-    /// lookup (lane 0) -- identical results to the byte-at-a-time
-    /// reference algorithm, just batched.
+    /// On `x86_64`, tries the PCLMULQDQ carry-less-multiply folding path
+    /// first (see [`crate::crc32_pclmulqdq::Pclmulqdq`]) -- it declines
+    /// (returning control here) for short inputs or CPUs lacking the
+    /// needed instructions, in which case (and on every other
+    /// architecture) this falls back to the scalar slicing-by-8 path
+    /// below.
     pub fn update(&mut self, bytes: &[u8]) -> &mut Self {
-        let mut c = self.state;
+        self.state = Self::update_state(self.state, bytes);
+        self
+    }
+
+    fn update_state(state: u32, bytes: &[u8]) -> u32 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if let Some(folded) = crate::crc32_pclmulqdq::Pclmulqdq::try_update(state, bytes) {
+                return folded;
+            }
+        }
+        Self::update_state_scalar(state, bytes)
+    }
+
+    /// The plain slicing-by-8 core, operating directly on a CRC register
+    /// value rather than `&mut self` -- pulled out of [`Self::update`] so
+    /// [`crate::crc32_pclmulqdq::Pclmulqdq`] can hand off its own
+    /// sub-16-byte tail (after PCLMULQDQ folding + Barrett reduction has
+    /// already produced a register-domain CRC value identical in kind to
+    /// this function's `state` parameter) to the *same* verified scalar
+    /// implementation, instead of a second hand-ported copy of it.
+    pub(crate) fn update_state_scalar(state: u32, bytes: &[u8]) -> u32 {
+        let mut c = state;
         let mut chunks = bytes.chunks_exact(8);
         for chunk in &mut chunks {
             // Fold the running CRC's 4 bytes in as the first 4 input
@@ -106,8 +130,7 @@ impl Crc32 {
         for &byte in chunks.remainder() {
             c = Self::TABLES[0][((c ^ u32::from(byte)) & 0xFF) as usize] ^ (c >> 8);
         }
-        self.state = c;
-        self
+        c
     }
 
     /// Finalize: PNG XORs the running state with `0xffffffff` to produce

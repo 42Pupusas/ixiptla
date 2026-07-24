@@ -13,6 +13,8 @@ mod adam7;
 mod chunk;
 mod color_type;
 mod crc32;
+#[cfg(target_arch = "x86_64")]
+mod crc32_pclmulqdq;
 mod decoder;
 mod defilter;
 mod filter_type;

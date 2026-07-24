@@ -18,7 +18,7 @@
 
 use divan::Bencher;
 use ixiptla_bench::fixtures::{BENCH_SIDES, SquareFixture};
-use ixiptla_core::{ColorType, Defilter, Ihdr, InterlaceMethod, Png, RgbaExpander};
+use ixiptla_core::{ColorType, Crc32, Defilter, Ihdr, InterlaceMethod, Png, RgbaExpander};
 use png::ColorType as PngColorType;
 use png::Filter as PngFilter;
 
@@ -294,4 +294,25 @@ fn decode_truecolor_alpha(bencher: Bencher, side: u32) {
 fn decode_adam7_truecolor(bencher: Bencher, side: u32) {
     let file = ixiptla_bench::fixtures::adam7_truecolor_fixture(side);
     bencher.bench_local(|| Png::decode(divan::black_box(&file), 1 << 24).unwrap());
+}
+
+/// [`Crc32`] in isolation over a buffer sized like a real large `IDAT`
+/// payload -- isolates the PCLMULQDQ fold's own per-byte cost from
+/// everything else `Png::decode` does, mirroring how the `defilter_*`
+/// benchmarks above isolate `Defilter` from inflate/chunk-parsing. Sizes
+/// mirror `BENCH_SIDES` scaled to roughly a truecolor-alpha image's byte
+/// count (`side * side * 4`), so this stays comparable to the other
+/// per-stage numbers at the same nominal image size.
+#[divan::bench(args = BENCH_SIDES)]
+fn crc32_of_idat_sized_buffer(bencher: Bencher, side: u32) {
+    let len = side as usize * side as usize * 4;
+    let mut src = 0x1234_5678u32;
+    let mut next_byte = move || {
+        src ^= src << 13;
+        src ^= src >> 17;
+        src ^= src << 5;
+        (src & 0xFF) as u8
+    };
+    let data: Vec<u8> = (0..len).map(|_| next_byte()).collect();
+    bencher.bench_local(|| Crc32::of(divan::black_box(&data)));
 }

@@ -436,6 +436,15 @@ impl WrappingAverageScan {
             previous_row.len(),
             "scan_suffix: length mismatch"
         );
+        // `bpp == 1` (grayscale/indexed) can't use the SSE2 paths below:
+        // at a 1-byte stride the loop-carried dependency is between
+        // *adjacent* bytes, so there is no width to vectorize over at
+        // all. It gets a dedicated scalar loop instead -- see
+        // [`Self::scan_suffix_bpp1`] for why that's much faster than the
+        // general scalar fallback despite doing the same arithmetic.
+        if bpp == 1 {
+            return Self::scan_suffix_bpp1(content, previous_row);
+        }
         #[cfg(target_arch = "x86_64")]
         {
             match bpp {
@@ -445,6 +454,41 @@ impl WrappingAverageScan {
             }
         }
         Self::scan_suffix_scalar(content, previous_row, bpp);
+    }
+
+    /// `bpp == 1` specialization of [`Self::scan_suffix_scalar`].
+    ///
+    /// Identical arithmetic, but it carries the left neighbour `a` in a
+    /// register across iterations (it's just the byte this loop wrote
+    /// last time) and walks `content`/`previous_row` as zipped iterators
+    /// rather than by index. The general loop's `content[i - bpp]` reads
+    /// back a byte it stored on the previous iteration, which -- through
+    /// an index whose provenance the optimizer can't tie to the store --
+    /// forces a real reload plus three bounds checks per byte, on top of
+    /// a dependency chain that already can't be vectorized. Hoisting `a`
+    /// into a register leaves one load, one add, one shift and one store
+    /// per byte and no bounds checks at all.
+    ///
+    /// Measured on `defilter_grayscale_average_only` at 1024px, where
+    /// this path is the entire cost of the benchmark.
+    fn scan_suffix_bpp1(content: &mut [u8], previous_row: &[u8]) {
+        // `previous_row[0]` is the caller's prefix byte -- `b` for this
+        // loop starts at index 1, in step with `content[1..]`.
+        let (Some((_, rest_prev)), Some((&a_init, rest))) = (
+            previous_row.split_first(),
+            content.split_first_mut().map(|(a, r)| (&*a, r)),
+        ) else {
+            return;
+        };
+        let mut a = a_init;
+        for (byte, &b) in rest.iter_mut().zip(rest_prev) {
+            // `u8::midpoint` is exactly floor((a + b) / 2) computed
+            // without overflowing -- the same value the widening `u16`
+            // form in the general loop produces, without the widen.
+            let recon = byte.wrapping_add(u8::midpoint(a, b));
+            *byte = recon;
+            a = recon;
+        }
     }
 
     fn scan_suffix_scalar(content: &mut [u8], previous_row: &[u8], bpp: usize) {
@@ -632,6 +676,12 @@ impl WrappingPaethScan {
             previous_row.len(),
             "scan_suffix: length mismatch"
         );
+        // `bpp == 1` has no vectorizable width (the dependency is between
+        // adjacent bytes), so it takes a dedicated register-carrying
+        // scalar loop -- see [`Self::scan_suffix_bpp1`].
+        if bpp == 1 {
+            return Self::scan_suffix_bpp1(content, previous_row);
+        }
         #[cfg(target_arch = "x86_64")]
         {
             // Unlike this module's other SIMD paths, the fpnge Paeth
@@ -647,6 +697,38 @@ impl WrappingPaethScan {
             }
         }
         Self::scan_suffix_scalar(content, previous_row, bpp);
+    }
+
+    /// `bpp == 1` specialization of [`Self::scan_suffix_scalar`].
+    ///
+    /// Same predictor, but both loop-carried neighbours become registers:
+    /// `a` is the byte this loop reconstructed last iteration, and `c` is
+    /// simply last iteration's `b` (at a 1-byte stride, "upper-left" is
+    /// the previous "above"). That removes, per byte, one reload of a
+    /// just-stored value, one redundant load of `previous_row[i - 1]`,
+    /// and three bounds checks -- leaving the predictor arithmetic as the
+    /// only real work on a chain that can't be vectorized anyway.
+    ///
+    /// This is the single hottest loop in a grayscale decode: at 1024px
+    /// `defilter_grayscale_paeth_only` was ~60x the cost of the SIMD
+    /// `Sub` path over the same byte count before this specialization.
+    fn scan_suffix_bpp1(content: &mut [u8], previous_row: &[u8]) {
+        // `c` trails `b` by one byte; both start at index 0, which the
+        // caller's prefix step has already accounted for.
+        let (Some((&c_init, rest_prev)), Some((&a_init, rest))) = (
+            previous_row.split_first(),
+            content.split_first_mut().map(|(a, r)| (&*a, r)),
+        ) else {
+            return;
+        };
+        let mut a = a_init;
+        let mut c = c_init;
+        for (byte, &b) in rest.iter_mut().zip(rest_prev) {
+            let recon = byte.wrapping_add(Self::paeth_predictor(a, b, c));
+            *byte = recon;
+            a = recon;
+            c = b;
+        }
     }
 
     fn scan_suffix_scalar(content: &mut [u8], previous_row: &[u8], bpp: usize) {
@@ -1046,6 +1128,44 @@ mod tests {
                 WrappingPaethScan::scan_suffix(&mut actual, &previous_row, bpp);
                 assert_eq!(actual, expected, "bpp={bpp} len={len}");
             }
+        }
+    }
+
+    /// Pins the `bpp == 1` specializations (`WrappingAverageScan::
+    /// scan_suffix_bpp1` / `WrappingPaethScan::scan_suffix_bpp1`)
+    /// against the reference across long runs.
+    ///
+    /// The `for_every_supported_bpp` sweeps above already include
+    /// `bpp == 1`, but they'd also pass if that case silently fell back
+    /// to the general scalar loop -- which is exactly what these
+    /// specializations replaced. These cases use lengths long enough to
+    /// exercise a sustained register-carried dependency chain (where a
+    /// mistake in the 'a is last iteration's output' / 'c is last
+    /// iteration's b' carry shows up as drift partway through the row
+    /// rather than at the first byte), plus the degenerate empty/1-byte
+    /// rows where the specializations' `split_first` guards are the only
+    /// thing standing between them and a panic.
+    #[test]
+    fn bpp1_specializations_match_scalar_reference_over_long_rows() {
+        for len in [0usize, 1, 2, 3, 255, 256, 257, 1024, 4095] {
+            #[allow(clippy::cast_possible_truncation)]
+            let content: Vec<u8> = (0..len as u32)
+                .map(|n| ((n * 131 + 19) % 256) as u8)
+                .collect();
+            #[allow(clippy::cast_possible_truncation)]
+            let previous_row: Vec<u8> = (0..len as u32)
+                .map(|n| ((n * 197 + 41) % 256) as u8)
+                .collect();
+
+            let expected = scalar_average_suffix(&content, &previous_row, 1);
+            let mut actual = content.clone();
+            WrappingAverageScan::scan_suffix(&mut actual, &previous_row, 1);
+            assert_eq!(actual, expected, "average bpp=1 len={len}");
+
+            let expected = scalar_paeth_suffix(&content, &previous_row, 1);
+            let mut actual = content.clone();
+            WrappingPaethScan::scan_suffix(&mut actual, &previous_row, 1);
+            assert_eq!(actual, expected, "paeth bpp=1 len={len}");
         }
     }
 

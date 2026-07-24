@@ -14,10 +14,14 @@
 //! sample to `ixiptla_core` itself, giving a much cleaner call graph /
 //! flat profile to read.
 //!
-//! Usage: `decode_loop [side] [iterations]` (both optional, defaulting
-//! to a large image and a moderate iteration count -- large enough that
-//! per-call overhead is negligible next to the per-pixel inner loops
-//! this is meant to profile).
+//! Usage: `decode_loop [side] [iterations] [color_type]` (all optional;
+//! defaulting to a large image and a moderate iteration count -- large
+//! enough that per-call overhead is negligible next to the per-pixel
+//! inner loops this is meant to profile -- and to `rgba`). `color_type`
+//! is `rgba` or `gray`, so the same harness can profile either
+//! `RgbaExpander` fast path; they have very different shapes (`rgba`'s
+//! is an identity transform, `gray`'s a 1-to-4-byte fan-out) and so
+//! very different profiles.
 
 use ixiptla_bench::fixtures::SquareFixture;
 use ixiptla_core::{Png, RgbaExpander};
@@ -25,11 +29,53 @@ use png::ColorType as PngColorType;
 use std::hint::black_box;
 use std::time::Instant;
 
+/// Which colour type of fixture to profile.
+///
+/// A named enum rather than a bare `PngColorType` so the binary owns its
+/// own CLI vocabulary (`rgba`/`gray`) and the label it prints, instead of
+/// leaking the `png` crate's spelling into the command line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fixture {
+    /// 8-bit truecolor-alpha: `RgbaExpander`'s identity fast path.
+    Rgba,
+    /// 8-bit grayscale: `RgbaExpander`'s 1-byte-to-4-byte fan-out path.
+    Grayscale,
+}
+
+impl Fixture {
+    /// Parses the CLI spelling, defaulting to `Rgba` for anything
+    /// unrecognized (including absent) so the binary's original
+    /// two-argument invocation keeps its old meaning.
+    fn from_arg(arg: Option<&str>) -> Self {
+        match arg {
+            Some("gray" | "grayscale") => Self::Grayscale,
+            _ => Self::Rgba,
+        }
+    }
+
+    /// The `png` crate colour type used to build the fixture.
+    const fn png_color_type(self) -> PngColorType {
+        match self {
+            Self::Rgba => PngColorType::Rgba,
+            Self::Grayscale => PngColorType::Grayscale,
+        }
+    }
+
+    /// Human-readable label for the summary line.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Rgba => "truecolor-alpha",
+            Self::Grayscale => "grayscale",
+        }
+    }
+}
+
 /// Command-line configuration for one profiling run: how big a fixture
-/// to decode and how many times to decode it.
+/// to decode, how many times to decode it, and of which colour type.
 struct RunConfig {
     side: u32,
     iterations: u32,
+    fixture: Fixture,
 }
 
 impl RunConfig {
@@ -41,7 +87,12 @@ impl RunConfig {
         let mut args = std::env::args().skip(1);
         let side = args.next().and_then(|s| s.parse().ok()).unwrap_or(1024);
         let iterations = args.next().and_then(|s| s.parse().ok()).unwrap_or(200);
-        Self { side, iterations }
+        let fixture = Fixture::from_arg(args.next().as_deref());
+        Self {
+            side,
+            iterations,
+            fixture,
+        }
     }
 }
 
@@ -54,13 +105,12 @@ struct DecodeLoop {
     iterations: u32,
 }
 
+
 impl DecodeLoop {
-    /// Builds a truecolor-alpha fixture once (the color type whose
-    /// `RgbaExpander::expand` path is the current optimization target,
-    /// per the `ixiptla-bench` allocation/timing findings) and pairs it
-    /// with the iteration count to run it for.
+    /// Builds the requested fixture once and pairs it with the iteration
+    /// count to run it for.
     fn new(config: &RunConfig) -> Self {
-        let file = SquareFixture::new(config.side, PngColorType::Rgba).encode();
+        let file = SquareFixture::new(config.side, config.fixture.png_color_type()).encode();
         Self {
             file,
             iterations: config.iterations,
@@ -97,10 +147,11 @@ fn main() {
     let config = RunConfig::from_args();
     let side = config.side;
     let iterations = config.iterations;
+    let label = config.fixture.label();
     let workload = DecodeLoop::new(&config);
     let elapsed = workload.run();
     println!(
-        "decode_loop: {iterations} iterations of {side}x{side} truecolor-alpha in {elapsed:?} ({:?}/iter)",
+        "decode_loop: {iterations} iterations of {side}x{side} {label} in {elapsed:?} ({:?}/iter)",
         elapsed / iterations.max(1),
     );
 }

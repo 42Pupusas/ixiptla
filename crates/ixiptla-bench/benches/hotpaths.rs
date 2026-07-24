@@ -255,6 +255,85 @@ fn defilter_grayscale(bencher: Bencher, side: u32) {
         });
 }
 
+/// The same per-filter isolation as the `defilter_truecolor_alpha_*`
+/// benches above, but at `bpp == 1` (grayscale).
+///
+/// These exist because `defilter_grayscale` at 1024px measured *slower*
+/// than `defilter_truecolor_alpha` (~2.1ms vs ~1.15ms) despite having
+/// exactly a quarter as many bytes to reconstruct -- roughly 7x worse
+/// per byte. That inversion has to come from a missing fast path rather
+/// than from the work itself, and `simd.rs` only instantiates its
+/// `Average`/`Paeth` SSE2 loops for `BPP` in `{3, 4}`, so `bpp == 1`
+/// falls back to `scan_suffix_scalar`. Splitting the aggregate per
+/// filter type is what turns that from a plausible story into a
+/// measured one -- if the scalar fallback is the cause, `average_only`
+/// and `paeth_only` should dominate while `sub_only`/`up_only` (which
+/// do have `bpp == 1` paths, via `WrappingPrefixSum`/`WrappingByteAdder`)
+/// stay cheap.
+#[divan::bench(args = BENCH_SIDES)]
+fn defilter_grayscale_sub_only(bencher: Bencher, side: u32) {
+    let stream = FilteredStream::build_with_filter(
+        side,
+        ColorType::Grayscale,
+        PngColorType::Grayscale,
+        Some(PngFilter::Sub),
+    );
+    bencher
+        .with_inputs(|| stream.inflated.clone())
+        .bench_local_values(|mut inflated| {
+            FilteredStream::defilter_all_rows(&stream.ihdr, &mut inflated);
+            inflated
+        });
+}
+
+#[divan::bench(args = BENCH_SIDES)]
+fn defilter_grayscale_up_only(bencher: Bencher, side: u32) {
+    let stream = FilteredStream::build_with_filter(
+        side,
+        ColorType::Grayscale,
+        PngColorType::Grayscale,
+        Some(PngFilter::Up),
+    );
+    bencher
+        .with_inputs(|| stream.inflated.clone())
+        .bench_local_values(|mut inflated| {
+            FilteredStream::defilter_all_rows(&stream.ihdr, &mut inflated);
+            inflated
+        });
+}
+
+#[divan::bench(args = BENCH_SIDES)]
+fn defilter_grayscale_average_only(bencher: Bencher, side: u32) {
+    let stream = FilteredStream::build_with_filter(
+        side,
+        ColorType::Grayscale,
+        PngColorType::Grayscale,
+        Some(PngFilter::Avg),
+    );
+    bencher
+        .with_inputs(|| stream.inflated.clone())
+        .bench_local_values(|mut inflated| {
+            FilteredStream::defilter_all_rows(&stream.ihdr, &mut inflated);
+            inflated
+        });
+}
+
+#[divan::bench(args = BENCH_SIDES)]
+fn defilter_grayscale_paeth_only(bencher: Bencher, side: u32) {
+    let stream = FilteredStream::build_with_filter(
+        side,
+        ColorType::Grayscale,
+        PngColorType::Grayscale,
+        Some(PngFilter::Paeth),
+    );
+    bencher
+        .with_inputs(|| stream.inflated.clone())
+        .bench_local_values(|mut inflated| {
+            FilteredStream::defilter_all_rows(&stream.ihdr, &mut inflated);
+            inflated
+        });
+}
+
 /// [`RgbaExpander::expand`] in isolation: pre-decoded (defiltered,
 /// non-interlaced) pixel bytes in, RGBA8 out -- isolates the
 /// bit-unpacking/scaling/palette-lookup cost from everything upstream of

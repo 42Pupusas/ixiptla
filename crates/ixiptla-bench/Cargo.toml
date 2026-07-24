@@ -46,3 +46,7 @@ harness = false
 [[bench]]
 name = "end_to_end"
 harness = false
+
+[[bench]]
+name = "encode"
+harness = false

@@ -14,4 +14,10 @@
 //! fixture decode to" only has one definition to keep consistent between
 //! the hotpath and end-to-end suites.
 
+//! [`raw_image`] is the mirror image of that for the *encode* suite
+//! (`benches/encode.rs`): encoding starts from raw scanlines rather than
+//! file bytes, and needs compressible content to make output-size
+//! comparisons mean anything.
+
 pub mod fixtures;
+pub mod raw_image;

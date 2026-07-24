@@ -13,6 +13,14 @@ const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 pub struct Signature;
 
 impl Signature {
+    /// The signature bytes themselves, for an encoder to emit at the head
+    /// of a file.
+    ///
+    /// Exposed as a constant rather than a `write` method so the encoder
+    /// can append it to its own buffer, and so there is still exactly one
+    /// definition of the magic shared by both directions.
+    pub const BYTES: [u8; 8] = PNG_SIGNATURE;
+
     /// Verify `input` starts with the PNG signature and return the
     /// remaining bytes (the chunk stream) after it.
     pub fn strip(input: &[u8]) -> Result<&[u8], SignatureError> {

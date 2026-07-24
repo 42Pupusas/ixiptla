@@ -33,7 +33,89 @@
 //! can reach it too, to diff-test against the real-world `PngSuite`
 //! corpus alongside the synthetic fixtures built below.
 
+//! The reverse direction is covered too: [`encoder_conformance`] hands
+//! files produced by `ixiptla_core::Encoder` to the `png` crate's decoder,
+//! so our *output* is validated by an independent implementation rather
+//! than only by our own decoder (which could share a misreading with it).
+
+pub mod encoder_conformance;
 pub mod reference_decoder;
+
+pub use encoder_conformance::EncoderConformance;
+pub use reference_decoder::ReferenceComparison;
+
+#[cfg(test)]
+mod encoder_tests {
+    use crate::EncoderConformance;
+    use ixiptla_core::{ColorType, FilterStrategy, FilterType, InterlaceMethod};
+
+    #[test]
+    fn png_crate_accepts_every_color_type_and_bit_depth_we_encode() {
+        // Width 13 is deliberately not a multiple of 8, so sub-byte depths
+        // exercise scanline padding.
+        for (color_type, bit_depth) in [
+            (ColorType::Grayscale, 1u8),
+            (ColorType::Grayscale, 2),
+            (ColorType::Grayscale, 4),
+            (ColorType::Grayscale, 8),
+            (ColorType::Grayscale, 16),
+            (ColorType::Truecolor, 8),
+            (ColorType::Truecolor, 16),
+            (ColorType::GrayscaleAlpha, 8),
+            (ColorType::GrayscaleAlpha, 16),
+            (ColorType::TruecolorAlpha, 8),
+            (ColorType::TruecolorAlpha, 16),
+        ] {
+            EncoderConformance::new(13, 7, color_type, bit_depth, InterlaceMethod::None)
+                .assert_matches(FilterStrategy::Adaptive);
+        }
+    }
+
+    #[test]
+    fn png_crate_accepts_every_fixed_filter_we_emit() {
+        // Each filter must be independently conformant, not just whichever
+        // one the adaptive heuristic happens to choose.
+        for filter_type in FilterType::ALL {
+            for (color_type, bit_depth) in [
+                (ColorType::Grayscale, 8u8),
+                (ColorType::TruecolorAlpha, 8),
+                (ColorType::TruecolorAlpha, 16),
+            ] {
+                EncoderConformance::new(17, 5, color_type, bit_depth, InterlaceMethod::None)
+                    .assert_matches(FilterStrategy::Fixed(filter_type));
+            }
+        }
+    }
+
+    #[test]
+    fn png_crate_accepts_our_adam7_interlaced_output() {
+        // The `png` crate cannot *write* Adam7, but it does decode it --
+        // which is exactly the direction needed to check our pass layout
+        // against an independent implementation.
+        for (color_type, bit_depth) in [
+            (ColorType::Grayscale, 1u8),
+            (ColorType::Grayscale, 8),
+            (ColorType::Truecolor, 8),
+            (ColorType::TruecolorAlpha, 8),
+            (ColorType::TruecolorAlpha, 16),
+        ] {
+            EncoderConformance::new(9, 7, color_type, bit_depth, InterlaceMethod::Adam7)
+                .assert_matches(FilterStrategy::Adaptive);
+        }
+    }
+
+    #[test]
+    fn png_crate_accepts_awkward_image_dimensions() {
+        // 1-pixel rows/columns, and sizes small enough that most Adam7
+        // passes are empty.
+        for (width, height) in [(1, 1), (1, 9), (9, 1), (2, 3), (3, 2), (5, 5)] {
+            EncoderConformance::new(width, height, ColorType::Truecolor, 8, InterlaceMethod::None)
+                .assert_matches(FilterStrategy::Adaptive);
+            EncoderConformance::new(width, height, ColorType::Truecolor, 8, InterlaceMethod::Adam7)
+                .assert_matches(FilterStrategy::Adaptive);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

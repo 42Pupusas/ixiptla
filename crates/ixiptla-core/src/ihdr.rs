@@ -112,6 +112,29 @@ impl Ihdr {
     pub const fn stride(&self) -> usize {
         (self.bits_per_pixel() as usize * self.width as usize).div_ceil(8)
     }
+
+    /// Serialize back to the 13-byte `IHDR` payload — the inverse of
+    /// [`Self::parse`].
+    ///
+    /// The compression and filter method bytes are always 0: those are the
+    /// only values the spec has ever defined, and `parse` rejects anything
+    /// else, so writing them as constants keeps the two directions
+    /// symmetric.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; Self::DATA_LEN] {
+        let mut out = [0u8; Self::DATA_LEN];
+        out[..4].copy_from_slice(&self.width.to_be_bytes());
+        out[4..8].copy_from_slice(&self.height.to_be_bytes());
+        out[8] = self.bit_depth;
+        out[9] = self.color_type.to_byte();
+        out[10] = 0;
+        out[11] = 0;
+        out[12] = match self.interlace {
+            InterlaceMethod::None => 0,
+            InterlaceMethod::Adam7 => 1,
+        };
+        out
+    }
 }
 
 /// Why [`Ihdr::parse`] rejected a chunk.
@@ -206,6 +229,29 @@ mod tests {
         let data = encode_ihdr(10, 10, 8, 6, 0, 0, 1);
         let ihdr = Ihdr::parse(&data).unwrap();
         assert_eq!(ihdr.interlace, InterlaceMethod::Adam7);
+    }
+
+    #[test]
+    fn to_bytes_round_trips_through_parse() {
+        for interlace in [InterlaceMethod::None, InterlaceMethod::Adam7] {
+            for (color_type, bit_depth) in [
+                (ColorType::Grayscale, 1u8),
+                (ColorType::Grayscale, 16),
+                (ColorType::Truecolor, 8),
+                (ColorType::IndexedColor, 4),
+                (ColorType::GrayscaleAlpha, 8),
+                (ColorType::TruecolorAlpha, 16),
+            ] {
+                let ihdr = Ihdr {
+                    width: 640,
+                    height: 480,
+                    bit_depth,
+                    color_type,
+                    interlace,
+                };
+                assert_eq!(Ihdr::parse(&ihdr.to_bytes()), Ok(ihdr));
+            }
+        }
     }
 
     #[test]

@@ -36,6 +36,20 @@ impl ColorType {
         }
     }
 
+    /// The `IHDR` colour type byte for this variant — the exact inverse of
+    /// [`Self::from_byte`], kept beside it so both directions of table 11.1
+    /// are defined together.
+    #[must_use]
+    pub const fn to_byte(self) -> u8 {
+        match self {
+            Self::Grayscale => 0,
+            Self::Truecolor => 2,
+            Self::IndexedColor => 3,
+            Self::GrayscaleAlpha => 4,
+            Self::TruecolorAlpha => 6,
+        }
+    }
+
     /// Samples per pixel — the multiplier between bit depth and the actual
     /// bits-per-pixel a scanline's filter/defilter math needs (spec
     /// §11.2.2's "Channels" column).
@@ -85,6 +99,19 @@ mod tests {
         assert_eq!(ColorType::from_byte(3), Ok(ColorType::IndexedColor));
         assert_eq!(ColorType::from_byte(4), Ok(ColorType::GrayscaleAlpha));
         assert_eq!(ColorType::from_byte(6), Ok(ColorType::TruecolorAlpha));
+    }
+
+    #[test]
+    fn to_byte_round_trips_through_from_byte() {
+        for color_type in [
+            ColorType::Grayscale,
+            ColorType::Truecolor,
+            ColorType::IndexedColor,
+            ColorType::GrayscaleAlpha,
+            ColorType::TruecolorAlpha,
+        ] {
+            assert_eq!(ColorType::from_byte(color_type.to_byte()), Ok(color_type));
+        }
     }
 
     #[test]

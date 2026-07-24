@@ -64,6 +64,27 @@ impl Transparency {
         }
     }
 
+    /// Serialize back to a `tRNS` chunk payload — the inverse of
+    /// [`Self::parse`].
+    ///
+    /// Grayscale and truecolour samples are always stored as 2 bytes each
+    /// regardless of the image's bit depth (spec §11.3.2), which is why
+    /// this doesn't need to know the bit depth to write them.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Grayscale(gray) => gray.to_be_bytes().to_vec(),
+            Self::Truecolor(r, g, b) => {
+                let mut out = Vec::with_capacity(6);
+                out.extend_from_slice(&r.to_be_bytes());
+                out.extend_from_slice(&g.to_be_bytes());
+                out.extend_from_slice(&b.to_be_bytes());
+                out
+            }
+            Self::IndexedColor(alphas) => alphas.clone(),
+        }
+    }
+
     /// The alpha value for palette index `index`, per spec §11.3.2:
     /// entries past the end of an [`Self::IndexedColor`] list (or any
     /// index queried against a non-indexed variant) default to fully
@@ -145,6 +166,24 @@ mod tests {
         assert_eq!(t.alpha_for_index(1), 128);
         assert_eq!(t.alpha_for_index(2), 255);
         assert_eq!(t.alpha_for_index(3), 255); // past the end: opaque
+    }
+
+    #[test]
+    fn to_bytes_round_trips_through_parse() {
+        for (color_type, transparency) in [
+            (ColorType::Grayscale, Transparency::Grayscale(0x1234)),
+            (
+                ColorType::Truecolor,
+                Transparency::Truecolor(0x0102, 0x0304, 0x0506),
+            ),
+            (
+                ColorType::IndexedColor,
+                Transparency::IndexedColor(vec![0, 128, 255]),
+            ),
+        ] {
+            let bytes = transparency.to_bytes();
+            assert_eq!(Transparency::parse(color_type, &bytes), Ok(transparency));
+        }
     }
 
     #[test]

@@ -209,12 +209,131 @@ impl Adam7 {
             }
         }
     }
+
+    /// Bytes in one scanline of `pass`'s own sub-image.
+    ///
+    /// A pass is itself a valid non-interlaced image of `pass.width`
+    /// pixels, so its stride follows the same round-up-to-whole-bytes rule
+    /// as [`Ihdr::stride`] -- shared here so gather/scatter and the encoder
+    /// cannot disagree about a pass's row length.
+    #[must_use]
+    pub const fn pass_stride(&self, pass: &Adam7Pass) -> usize {
+        (self.bits_per_pixel as usize * pass.width as usize).div_ceil(8)
+    }
+
+    /// Collect the pixels belonging to `pass` out of a full image into a
+    /// compact sub-image -- the exact inverse of [`Self::scatter_pass`].
+    ///
+    /// `full_image` is `height * stride` bytes of packed scanlines; the
+    /// returned buffer is `pass.height` rows of [`Self::pass_stride`]
+    /// bytes, which is precisely what an encoder filters and compresses
+    /// for this pass. Empty passes yield an empty buffer, matching
+    /// `scatter_pass`'s early return.
+    #[must_use]
+    pub fn gather_pass(&self, pass: &Adam7Pass, full_image: &[u8]) -> Vec<u8> {
+        if pass.is_empty() {
+            return Vec::new();
+        }
+        let pass_stride = self.pass_stride(pass);
+        let mut pass_pixels = vec![0u8; pass_stride * pass.height as usize];
+
+        for pass_y in 0..pass.height {
+            let full_y = pass.full_y(pass_y) as usize;
+            let src_row = &full_image[full_y * self.stride..][..self.stride];
+            let dst_row = &mut pass_pixels[pass_y as usize * pass_stride..][..pass_stride];
+
+            for pass_x in 0..pass.width {
+                let full_x = pass.full_x(pass_x);
+                PixelBits::copy_pixel(
+                    src_row,
+                    full_x as usize,
+                    dst_row,
+                    pass_x as usize,
+                    self.bits_per_pixel,
+                );
+            }
+        }
+        pass_pixels
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Adam7, Adam7Pass};
     use crate::{ColorType, Ihdr, InterlaceMethod};
+
+    #[test]
+    fn gather_then_scatter_reconstructs_the_original_image() {
+        // The round-trip an encoder depends on: splitting an image into 7
+        // passes and reassembling them must be lossless for every pixel.
+        for (color_type, bit_depth, width, height) in [
+            (ColorType::Grayscale, 8u8, 9u32, 7u32),
+            (ColorType::Truecolor, 8, 8, 8),
+            (ColorType::TruecolorAlpha, 16, 5, 3),
+            (ColorType::Grayscale, 1, 13, 5),
+            (ColorType::IndexedColor, 4, 6, 6),
+            // Small enough that several later passes are entirely empty.
+            (ColorType::Grayscale, 8, 1, 1),
+            (ColorType::Truecolor, 8, 3, 1),
+        ] {
+            let ihdr = Ihdr {
+                width,
+                height,
+                bit_depth,
+                color_type,
+                interlace: InterlaceMethod::Adam7,
+            };
+            let adam7 = Adam7::new(&ihdr);
+            let original: Vec<u8> = (0..ihdr.stride() * height as usize)
+                .map(|i| u8::try_from((i * 31 + 7) % 256).expect("masked into u8 range"))
+                .collect();
+
+            let mut rebuilt = vec![0u8; original.len()];
+            for pass in adam7.passes() {
+                let gathered = adam7.gather_pass(&pass, &original);
+                assert_eq!(
+                    gathered.len(),
+                    adam7.pass_stride(&pass) * pass.height as usize
+                );
+                adam7.scatter_pass(&pass, &gathered, &mut rebuilt);
+            }
+
+            // Sub-byte depths can leave padding bits at the end of a row
+            // untouched, so compare only the meaningful leading bits of
+            // each row rather than raw byte equality.
+            let used_bits = ihdr.bits_per_pixel() as usize * width as usize;
+            for y in 0..height as usize {
+                let row_at = y * ihdr.stride();
+                for bit in 0..used_bits {
+                    let original_bit = (original[row_at + bit / 8] >> (7 - bit % 8)) & 1;
+                    let rebuilt_bit = (rebuilt[row_at + bit / 8] >> (7 - bit % 8)) & 1;
+                    assert_eq!(
+                        original_bit, rebuilt_bit,
+                        "{color_type:?} depth {bit_depth} {width}x{height}: bit {bit} of row {y}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gather_pass_yields_nothing_for_an_empty_pass() {
+        let ihdr = Ihdr {
+            width: 1,
+            height: 1,
+            bit_depth: 8,
+            color_type: ColorType::Grayscale,
+            interlace: InterlaceMethod::Adam7,
+        };
+        let adam7 = Adam7::new(&ihdr);
+        let passes = adam7.passes();
+        // A 1x1 image puts its only pixel in pass 1; the rest are empty.
+        assert!(!passes[0].is_empty());
+        for pass in &passes[1..] {
+            assert!(pass.is_empty());
+            assert!(adam7.gather_pass(pass, &[42]).is_empty());
+        }
+    }
 
     #[test]
     fn pass_pixel_counts_match_spec_worked_example_8x8() {

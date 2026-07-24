@@ -30,6 +30,13 @@ impl Palette {
         Ok(Self { entries })
     }
 
+    /// Serialize back to a `PLTE` chunk payload — the inverse of
+    /// [`Self::parse`].
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.entries.concat()
+    }
+
     /// How many entries this palette has.
     #[must_use]
     pub const fn len(&self) -> usize {
@@ -110,6 +117,14 @@ mod tests {
     fn empty_palette_is_valid_but_empty() {
         let palette = Palette::parse(&[]).unwrap();
         assert!(palette.is_empty());
+    }
+
+    #[test]
+    fn to_bytes_round_trips_through_parse() {
+        let data: Vec<u8> = (0..30u8).collect();
+        let palette = Palette::parse(&data).unwrap();
+        assert_eq!(palette.to_bytes(), data);
+        assert_eq!(Palette::parse(&palette.to_bytes()), Ok(palette));
     }
 
     #[test]

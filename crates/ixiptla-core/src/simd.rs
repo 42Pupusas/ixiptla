@@ -394,7 +394,9 @@ mod tests {
 
     #[test]
     fn matches_scalar_wrapping_add_elementwise() {
+        #[allow(clippy::cast_possible_truncation)]
         let mut dst: Vec<u8> = (0..250u16).map(|n| (n % 256) as u8).collect();
+        #[allow(clippy::cast_possible_truncation)]
         let src: Vec<u8> = (0..250u16).map(|n| ((n * 7 + 3) % 256) as u8).collect();
         let expected: Vec<u8> = dst
             .iter()
@@ -408,7 +410,9 @@ mod tests {
     #[test]
     fn handles_lengths_not_a_multiple_of_simd_width() {
         for len in 0..40 {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let mut dst: Vec<u8> = (0..len as u16).map(|n| (n * 3) as u8).collect();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let src: Vec<u8> = (0..len as u16).map(|n| (n * 11) as u8).collect();
             let expected: Vec<u8> = dst
                 .iter()
@@ -456,6 +460,7 @@ mod tests {
         // the vectorized loop and its scalar tail continuation get
         // exercised.
         for len in [0, 1, 15, 16, 17, 31, 32, 33, 47, 48, 63, 100, 257] {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let data: Vec<u8> = (0..len as u32).map(|n| ((n * 37 + 5) % 256) as u8).collect();
             let expected = scalar_prefix_sum(&data);
             let mut actual = data.clone();
@@ -507,6 +512,7 @@ mod tests {
         // not go out of bounds or panic).
         for bpp in [2usize, 3, 4, 6, 8] {
             for len in [0usize, 1, bpp, bpp * 2, 15, 16, 17, 31, 32, 33, 100, 251] {
+                #[allow(clippy::cast_possible_truncation)]
                 let data: Vec<u8> = (0..len as u32).map(|n| ((n * 41 + 13) % 256) as u8).collect();
                 let expected = scalar_lane_scan(&data, bpp);
                 let mut actual = data.clone();
@@ -532,6 +538,7 @@ mod tests {
         // work correctly via the scalar fallback -- WrappingLaneScan::scan
         // doesn't assume bpp is one of the SSE2-special-cased values.
         for bpp in [5usize, 7, 9] {
+            #[allow(clippy::cast_possible_truncation)]
             let data: Vec<u8> = (0..40u32).map(|n| (n * 3) as u8).collect();
             let expected = scalar_lane_scan(&data, bpp);
             let mut actual = data.clone();

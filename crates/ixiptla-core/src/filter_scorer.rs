@@ -31,31 +31,26 @@
 //! same; this is a pure strength reduction, not an approximation.
 
 use crate::FilterType;
+use crate::filter_score_simd::{FilterScoreSimd, FilterScores};
 
-/// Running sum-of-absolute-residuals totals for all five candidate
-/// filters, accumulated over one scanline.
+/// Tie-breaking and winner selection over accumulated candidate scores.
 ///
-/// Held as a struct of named fields rather than an array so the mapping
-/// from filter to accumulator is checked by the compiler instead of by a
-/// magic index, and so [`Self::best`]'s tie-breaking order is explicit.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Scores {
-    none: u64,
-    sub: u64,
-    up: u64,
-    average: u64,
-    paeth: u64,
+/// The totals themselves live in [`FilterScores`] so the scalar and SIMD
+/// paths can both produce them; this trait adds the choosing.
+trait BestFilter {
+    /// The cheapest filter, ties broken in spec order.
+    fn best(self) -> FilterType;
 }
 
-impl Scores {
-    /// The cheapest filter, ties broken in spec order (None, Sub, Up,
-    /// Average, Paeth).
+impl BestFilter for FilterScores {
+    /// Ties break in spec order (None, Sub, Up, Average, Paeth).
     ///
     /// The order matters for reproducibility, not correctness: any of a
     /// tied set decodes identically, but a fixed order keeps encoder
     /// output deterministic across runs and platforms. It matches the
     /// order the five-pass implementation used (first strict improvement
-    /// wins), so this refactor cannot change which filter is chosen.
+    /// wins), so neither this nor the SIMD path can change which filter
+    /// is chosen.
     fn best(self) -> FilterType {
         let mut best = FilterType::None;
         let mut best_score = self.none;
@@ -113,25 +108,55 @@ impl FilterScorer {
             return self.best_without_previous_row(row);
         }
 
-        let mut scores = Scores::default();
-        for index in 0..row.len() {
-            let x = row[index];
-            // Before the first whole pixel there is no left neighbour, so
-            // `a` and `c` are zero — exactly the convention `Filter` uses.
-            let (a, c) = if index >= self.bpp {
-                (row[index - self.bpp], previous_row[index - self.bpp])
-            } else {
-                (0, 0)
-            };
-            let b = previous_row[index];
+        let mut scores = FilterScores::default();
 
-            scores.none += Self::magnitude(x);
-            scores.sub += Self::magnitude(x.wrapping_sub(a));
-            scores.up += Self::magnitude(x.wrapping_sub(b));
-            scores.average += Self::magnitude(x.wrapping_sub(u8::midpoint(a, b)));
-            scores.paeth += Self::magnitude(x.wrapping_sub(Self::paeth_predictor(a, b, c)));
+        // The first `bpp` bytes have no left neighbour, so `a` and `c` are
+        // zero there (the convention `Filter` uses). That is a different
+        // recurrence from the rest of the row, so it stays scalar rather
+        // than complicating the kernel with a masked first iteration.
+        let head = self.bpp.min(row.len());
+        for index in 0..head {
+            scores.add(self.score_at(row, previous_row, index, 0, 0));
         }
+
+        // Whole vectors, then whatever ragged tail is left over.
+        let vectored_end = if row.len() > head {
+            let (chunked, next) = FilterScoreSimd::score_chunks(row, previous_row, self.bpp, head);
+            scores.add(chunked);
+            next
+        } else {
+            head
+        };
+        for index in vectored_end..row.len() {
+            let a = row[index - self.bpp];
+            let c = previous_row[index - self.bpp];
+            scores.add(self.score_at(row, previous_row, index, a, c));
+        }
+
         scores.best()
+    }
+
+    /// One byte position's contribution to all five candidates, with `a`
+    /// and `c` supplied by the caller so the zero-neighbour prefix and the
+    /// general case share one body.
+    fn score_at(
+        &self,
+        row: &[u8],
+        previous_row: &[u8],
+        index: usize,
+        a: u8,
+        c: u8,
+    ) -> FilterScores {
+        let _ = self;
+        let x = row[index];
+        let b = previous_row[index];
+        FilterScores {
+            none: Self::magnitude(x),
+            sub: Self::magnitude(x.wrapping_sub(a)),
+            up: Self::magnitude(x.wrapping_sub(b)),
+            average: Self::magnitude(x.wrapping_sub(u8::midpoint(a, b))),
+            paeth: Self::magnitude(x.wrapping_sub(Self::paeth_predictor(a, b, c))),
+        }
     }
 
     /// Selection restricted to the two candidates that differ when the row
@@ -189,7 +214,8 @@ impl FilterScorer {
 
 #[cfg(test)]
 mod tests {
-    use super::{FilterScorer, Scores};
+    use super::{BestFilter, FilterScorer};
+    use crate::filter_score_simd::FilterScores;
     use crate::{ColorType, Filter, FilterType, Ihdr, InterlaceMethod};
 
     /// Reference implementation: the five-pass approach this module
@@ -346,7 +372,7 @@ mod tests {
         // All-equal scores must yield None, and a tie between two
         // non-None candidates must go to the earlier one, so encoder
         // output stays byte-for-byte reproducible.
-        let all_equal = Scores {
+        let all_equal = FilterScores {
             none: 10,
             sub: 10,
             up: 10,
@@ -355,7 +381,7 @@ mod tests {
         };
         assert_eq!(all_equal.best(), FilterType::None);
 
-        let up_and_average_tie = Scores {
+        let up_and_average_tie = FilterScores {
             none: 99,
             sub: 99,
             up: 10,

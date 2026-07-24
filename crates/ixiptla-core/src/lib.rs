@@ -22,6 +22,7 @@ mod decoder;
 mod defilter;
 mod encoder;
 mod filter;
+mod filter_score_simd;
 mod filter_scorer;
 mod filter_type;
 mod idat;

@@ -75,6 +75,26 @@ impl<'a> RgbaExpander<'a> {
             return Ok(pixels[..width * height * 4].to_vec());
         }
 
+        // 8-bit Grayscale has no true zero-copy path the way 8-bit
+        // TruecolorAlpha does above -- the source is 1 byte/pixel and the
+        // destination is inescapably 4 (v, v, v, a), so *some* buffer of 4x
+        // the size has to be written no matter what. What this fast path
+        // avoids instead is everything `expand_pixel`'s fully generic loop
+        // pays per pixel that this narrower case doesn't need: the `[u64;
+        // 4]` sample-array dance and `scale_to_u8` (both no-ops at
+        // bit_depth == 8, but not statically known to the compiler inside
+        // the generic loop), the `ColorType` match, the `is_transparent_gray`
+        // closure/Option indirection, and -- the actual dominant cost per
+        // the `rgba_expand_grayscale` benchmark -- one `Vec::extend_from_
+        // slice` call per pixel (4 bytes at a time) instead of writing
+        // directly into a single pre-sized `Vec` via direct indexing.
+        // `stride == width` here (1 byte/pixel, already byte-aligned), so
+        // `pixels[..width*height]` is exactly this image's sample bytes
+        // with no per-row padding to skip.
+        if self.ihdr.color_type == ColorType::Grayscale && self.ihdr.bit_depth == 8 {
+            return Ok(self.expand_grayscale_8bit_fast(&pixels[..width * height]));
+        }
+
         let mut out = Vec::with_capacity(width * height * 4);
         let channels = u32::from(self.ihdr.color_type.channel_count());
         let bit_depth = u32::from(self.ihdr.bit_depth);
@@ -87,6 +107,27 @@ impl<'a> RgbaExpander<'a> {
             }
         }
         Ok(out)
+    }
+
+    /// Fast path for `expand` at 8-bit `Grayscale`: writes directly into
+    /// one pre-sized output `Vec` via `chunks_exact_mut`, no per-pixel
+    /// `Vec::extend_from_slice` call, no `PixelBits`/`u64` sample-array
+    /// detour, and `tRNS` (if present) resolved to a plain `u16` compare
+    /// against the raw grayscale byte (widened, since `Transparency::
+    /// Grayscale` always stores its designated value as `u16` regardless
+    /// of the image's own bit depth -- spec §11.3.2).
+    fn expand_grayscale_8bit_fast(&self, samples: &[u8]) -> Vec<u8> {
+        let transparent_value = self.transparency.and_then(|t| match t {
+            Transparency::Grayscale(v) => Some(*v),
+            Transparency::Truecolor(..) | Transparency::IndexedColor(_) => None,
+        });
+
+        let mut out = vec![0u8; samples.len() * 4];
+        for (chunk, &v) in out.chunks_exact_mut(4).zip(samples) {
+            let a = if transparent_value == Some(u16::from(v)) { 0 } else { 255 };
+            chunk.copy_from_slice(&[v, v, v, a]);
+        }
+        out
     }
 
     /// Read pixel `x`'s `channels` samples (each `bit_depth` bits, packed
@@ -337,6 +378,45 @@ mod tests {
         ];
         let rgba = expander.expand(&pixels).unwrap();
         assert_eq!(rgba, pixels.to_vec());
+    }
+
+    /// Exercises the `expand`-level fast path for 8-bit `Grayscale` across
+    /// multiple pixels/rows -- a 1x1 image can't distinguish "reads the
+    /// right byte" from "reads byte 0 every time", so this uses distinct
+    /// values per pixel across 2 rows.
+    #[test]
+    fn expands_8bit_grayscale_multi_pixel_matches_per_pixel_path() {
+        let ihdr = ihdr(2, 2, 8, ColorType::Grayscale);
+        let expander = RgbaExpander::new(&ihdr, None, None);
+        let pixels = [10u8, 20, 30, 40]; // row0: 10,20  row1: 30,40
+        let rgba = expander.expand(&pixels).unwrap();
+        assert_eq!(
+            rgba,
+            vec![
+                10, 10, 10, 255, // row0 pixel0
+                20, 20, 20, 255, // row0 pixel1
+                30, 30, 30, 255, // row1 pixel0
+                40, 40, 40, 255, // row1 pixel1
+            ]
+        );
+    }
+
+    /// `tRNS` must still be honoured inside the fast path, not just the
+    /// generic per-pixel loop -- covers the same scenario as
+    /// `trns_makes_matching_grayscale_sample_transparent` but explicitly
+    /// through the 8-bit fast-path entry point (both tests hit the same
+    /// `expand` call; kept as two tests since either could regress
+    /// independently of the other if the fast path's condition ever
+    /// changes).
+    #[test]
+    fn trns_is_honoured_by_the_8bit_grayscale_fast_path() {
+        let ihdr = ihdr(2, 1, 8, ColorType::Grayscale);
+        let trns = Transparency::parse(ColorType::Grayscale, &[0x00, 0x80]).unwrap(); // sample 128
+        let expander = RgbaExpander::new(&ihdr, None, Some(&trns));
+        let pixels = [128u8, 200];
+        let rgba = expander.expand(&pixels).unwrap();
+        assert_eq!(&rgba[0..4], &[128, 128, 128, 0]);
+        assert_eq!(&rgba[4..8], &[200, 200, 200, 255]);
     }
 
     #[test]

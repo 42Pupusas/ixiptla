@@ -11,6 +11,7 @@
 
 mod adam7;
 mod chunk;
+mod chunk_writer;
 mod color_type;
 mod crc32;
 #[cfg(target_arch = "x86_64")]
@@ -19,6 +20,7 @@ mod crc32_pclmulqdq;
 mod crc32_vpclmulqdq;
 mod decoder;
 mod defilter;
+mod filter;
 mod filter_type;
 mod idat;
 mod ihdr;
@@ -31,10 +33,12 @@ mod transparency;
 
 pub use adam7::{Adam7, Adam7Pass};
 pub use chunk::{Chunk, ChunkError, ChunkReader};
+pub use chunk_writer::ChunkWriter;
 pub use color_type::{ColorType, InvalidColorType};
 pub use crc32::Crc32;
 pub use decoder::{DecodeError, Png};
 pub use defilter::Defilter;
+pub use filter::Filter;
 pub use filter_type::{FilterType, InvalidFilterType};
 pub use ihdr::{Ihdr, IhdrError, InterlaceMethod};
 pub use palette::{Palette, PaletteError};

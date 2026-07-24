@@ -27,6 +27,28 @@ impl FilterType {
             other => Err(InvalidFilterType(other)),
         }
     }
+
+    /// The filter-type byte an encoder writes at the head of a scanline —
+    /// the exact inverse of [`Self::from_byte`].
+    ///
+    /// Kept next to `from_byte` (rather than derived via `as u8` at call
+    /// sites) so the two directions of the spec's table 9.1 mapping are
+    /// defined together and can't silently drift apart; the round-trip is
+    /// asserted in this module's tests.
+    #[must_use]
+    pub const fn to_byte(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Sub => 1,
+            Self::Up => 2,
+            Self::Average => 3,
+            Self::Paeth => 4,
+        }
+    }
+
+    /// All five filter types, in spec order — the candidate set an encoder
+    /// scores per row when choosing a filter.
+    pub const ALL: [Self; 5] = [Self::None, Self::Sub, Self::Up, Self::Average, Self::Paeth];
 }
 
 /// A scanline's leading filter-type byte was outside 0..=4 (spec §9.2's
@@ -45,6 +67,27 @@ impl std::error::Error for InvalidFilterType {}
 #[cfg(test)]
 mod tests {
     use super::FilterType;
+
+    #[test]
+    fn to_byte_round_trips_through_from_byte() {
+        // Guards the two halves of table 9.1 against drifting apart: every
+        // variant must survive a full encode/decode cycle, and every byte
+        // the decoder accepts must map back to the same byte.
+        for filter in FilterType::ALL {
+            assert_eq!(FilterType::from_byte(filter.to_byte()), Ok(filter));
+        }
+        for byte in 0..=4u8 {
+            assert_eq!(FilterType::from_byte(byte).unwrap().to_byte(), byte);
+        }
+    }
+
+    #[test]
+    fn all_lists_every_variant_in_spec_order() {
+        assert_eq!(FilterType::ALL.len(), 5);
+        for (index, filter) in FilterType::ALL.iter().enumerate() {
+            assert_eq!(u8::try_from(index).unwrap(), filter.to_byte());
+        }
+    }
 
     #[test]
     fn decodes_all_five_filter_types() {

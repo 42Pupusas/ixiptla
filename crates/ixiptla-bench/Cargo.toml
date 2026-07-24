@@ -20,6 +20,11 @@ workspace = true
 # hotpaths.rs` and `benches/end_to_end.rs` link this crate's compiled lib
 # code, not its `#[cfg(test)]` code.
 ixiptla-core.workspace = true
+# hotpaths.rs's `FilteredStream::build` needs to zlib-inflate a fixture's
+# concatenated IDAT payload itself (to recover genuinely-filtered scanline
+# bytes for benchmarking `Defilter` in isolation, without `Png::decode`
+# defiltering them first) -- the same `ixchel` `ixiptla-core` itself uses.
+ixchel.workspace = true
 png = "0.18"
 # Only needed to hand-assemble the Adam7-interlaced fixture (`png` 0.18's
 # encoder can't write interlaced files -- same limitation documented in

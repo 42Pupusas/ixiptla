@@ -21,6 +21,29 @@ use ixiptla_bench::fixtures::{SquareFixture, BENCH_SIDES};
 use ixiptla_core::{ColorType, Defilter, Ihdr, InterlaceMethod, Png, RgbaExpander};
 use png::ColorType as PngColorType;
 
+/// Concatenate a PNG file's `IDAT` chunk payloads in file order (spec
+/// §5.6), skipping everything else -- a minimal, dependency-free chunk
+/// walk (just enough to find `IDAT`s, no CRC/PLTE/tRNS handling) used only
+/// to recover `FilteredStream::build`'s genuinely-filtered scanline bytes
+/// from a `SquareFixture`-encoded file without going through
+/// `Png::decode` (which would defilter them before this benchmark gets a
+/// chance to time that step).
+fn extract_idat(file: &[u8]) -> Vec<u8> {
+    let mut idat = Vec::new();
+    let mut pos = 8; // skip the 8-byte PNG signature
+    while pos + 8 <= file.len() {
+        let len = u32::from_be_bytes(file[pos..pos + 4].try_into().unwrap()) as usize;
+        let kind = &file[pos + 4..pos + 8];
+        let data_start = pos + 8;
+        let data_end = data_start + len;
+        if kind == b"IDAT" {
+            idat.extend_from_slice(&file[data_start..data_end]);
+        }
+        pos = data_end + 4; // skip the trailing 4-byte CRC
+    }
+    idat
+}
+
 // Wraps the system allocator so divan reports per-benchmark allocation
 // counts/bytes alongside timing -- lets us see e.g. that
 // `rgba_expand_*` allocates exactly one output Vec per call (as
@@ -59,22 +82,25 @@ impl FilteredStream {
             color_type,
             interlace: InterlaceMethod::None,
         };
-        // Decode via ixiptla_core to get `pixels` (already unfiltered) --
-        // simpler than re-implementing chunk parsing/inflate here just to
-        // recover the filtered bytes. This deliberately re-wraps them as
-        // filter-type-None rows rather than re-deriving Sub/Up/Average/
-        // Paeth-filtered ones: `Defilter::defilter_row`'s per-byte
-        // reconstruction cost is identical regardless of which of the 5
-        // filter types produced the input (same loop shape, same amount
-        // of arithmetic per byte), so a filter-type-None row is
-        // representative of all 5 for benchmarking purposes.
-        let decoded = Png::decode(&file, 1 << 24).expect("fixture must decode");
-        let stride = ihdr.stride();
-        let mut inflated = Vec::with_capacity((1 + stride) * side as usize);
-        for row in decoded.pixels.chunks_exact(stride) {
-            inflated.push(0); // filter type None
-            inflated.extend_from_slice(row);
-        }
+        // Recover the *actually filtered* scanline bytes -- concatenate
+        // this file's IDAT chunks and zlib-inflate them, stopping short of
+        // calling `Defilter::defilter_row` at all. This deliberately does
+        // NOT go through `Png::decode` and re-wrap the result as
+        // filter-type-None rows the way an earlier version of this
+        // benchmark did: `png`'s own encoder defaults to `Filter::
+        // Adaptive` (picks whichever of Sub/Up/Average/Paeth/None
+        // minimizes a per-row heuristic cost, per row), so a real file's
+        // rows are a genuine mix of all 5 filter types, each with real
+        // per-byte reconstruction arithmetic to do -- `FilterType::None`
+        // is a literal no-op (`match { None => {} ... }`), so benchmarking
+        // only-None rows was measuring a best case that essentially never
+        // occurs in practice and made `defilter_row` look far cheaper
+        // than it actually is in `Png::decode`'s real pipeline (confirmed
+        // via `perf` on `decode_loop`: `defilter_row` is ~47% of total
+        // decode cycles there, nowhere near what the old benchmark here
+        // implied).
+        let idat = extract_idat(&file);
+        let inflated = ixchel::zlib::decompress(&idat, 1 << 24).expect("fixture zlib decodes");
         Self { ihdr, inflated }
     }
 }

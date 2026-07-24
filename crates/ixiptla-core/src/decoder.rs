@@ -61,7 +61,13 @@ impl Png {
         // PLTE (spec §4.3, §11.2.3) must precede the first IDAT when present;
         // we don't enforce that ordering strictly here (a spec-violating but
         // otherwise-decodable file), just take whichever PLTE data we see.
-        let mut idat = Vec::new();
+        // `input.len()` upper-bounds how many bytes of `IDAT` payload
+        // could possibly exist in this file (they're a subset of it, plus
+        // per-chunk overhead) -- reserving against that avoids `idat`
+        // paying for `Vec`'s repeated grow-and-copy doubling as chunks
+        // accumulate, for the cost of one conservative up-front
+        // allocation instead.
+        let mut idat = Vec::with_capacity(input.len());
         let mut palette = None;
         let mut transparency = None;
         while let Some(chunk) = reader.next_chunk()? {
@@ -82,7 +88,20 @@ impl Png {
             return Err(DecodeError::MissingPalette);
         }
 
-        let inflated = ixchel::zlib::decompress(&idat, max_decompressed)?;
+        // The exact inflated size is knowable from `IHDR` alone, before
+        // looking at a single compressed byte -- one `1 + stride`-byte
+        // scanline per row for a non-interlaced image, or the sum of each
+        // `Adam7` pass's own (smaller) row count/stride for an interlaced
+        // one (spec §8.2: passes are concatenated back to back in the same
+        // inflated stream). Passing this through avoids `Inflater` falling
+        // back to its `input.len() * 3` guess, which for PNG's already-
+        // compressed IDAT bytes is frequently a large over- or under-shoot
+        // depending on how compressible the pixel data was -- an exact
+        // hint turns however many doubling reallocations a wrong guess
+        // costs into exactly one.
+        let inflated_size_hint = Self::expected_inflated_size(&ihdr);
+        let inflated =
+            ixchel::zlib::decompress_with_hint(&idat, max_decompressed, Some(inflated_size_hint))?;
 
         let pixels = match ihdr.interlace {
             InterlaceMethod::None => Self::defilter_sequential(&ihdr, inflated)?,
@@ -95,6 +114,37 @@ impl Png {
             palette,
             transparency,
         })
+    }
+
+    /// The exact byte count `IDAT` inflates to for this `IHDR`, computed
+    /// without looking at the compressed bytes at all -- see the call
+    /// site's comment in [`Self::decode`] for why this is worth passing to
+    /// `ixchel::zlib::decompress_with_hint` instead of letting it guess.
+    ///
+    /// Non-interlaced: `height` scanlines, each `1 + stride` bytes (the
+    /// leading filter-type byte plus the row's content).
+    ///
+    /// `Adam7`: the same per-row math, but per pass -- each pass is its
+    /// own tiny sequential image at [`Adam7Pass`]'s narrower width/height
+    /// (spec section 8.2), and passes are concatenated back to back in the
+    /// inflated stream, so the total is simply their sum. A pass an image
+    /// is too small to contribute any pixels to (`Adam7Pass::is_empty`)
+    /// contributes zero bytes, matching `defilter_adam7`'s own `continue`
+    /// for that case.
+    fn expected_inflated_size(ihdr: &Ihdr) -> usize {
+        match ihdr.interlace {
+            InterlaceMethod::None => ihdr.height as usize * (1 + ihdr.stride()),
+            InterlaceMethod::Adam7 => Adam7::new(ihdr)
+                .passes()
+                .iter()
+                .filter(|pass| !pass.is_empty())
+                .map(|pass| {
+                    let pass_stride =
+                        (ihdr.bits_per_pixel() as usize * pass.width as usize).div_ceil(8);
+                    pass.height as usize * (1 + pass_stride)
+                })
+                .sum(),
+        }
     }
 
     /// Defilter a non-interlaced `IDAT` stream: one flat sequence of

@@ -20,6 +20,7 @@ use divan::Bencher;
 use ixiptla_bench::fixtures::{SquareFixture, BENCH_SIDES};
 use ixiptla_core::{ColorType, Defilter, Ihdr, InterlaceMethod, Png, RgbaExpander};
 use png::ColorType as PngColorType;
+use png::Filter as PngFilter;
 
 /// Concatenate a PNG file's `IDAT` chunk payloads in file order (spec
 /// §5.6), skipping everything else -- a minimal, dependency-free chunk
@@ -74,7 +75,24 @@ impl FilteredStream {
     /// filter selection so this exercises a realistic mix of the 5
     /// filter types across rows, not just one uniformly.
     fn build(side: u32, color_type: ColorType, png_color_type: PngColorType) -> Self {
-        let file = SquareFixture::new(side, png_color_type).encode();
+        Self::build_with_filter(side, color_type, png_color_type, None)
+    }
+
+    /// Like [`Self::build`], but pins every row to a single `FilterType`
+    /// (via `SquareFixture::encode_with_filter`) instead of `png`'s
+    /// default adaptive per-row mix -- used to isolate one filter type's
+    /// reconstruction cost at a time, e.g. to check whether `undo_paeth`/
+    /// `undo_average` (the two filter types with no SIMD fast path) are
+    /// actually the dominant cost within a realistic adaptive-filtered
+    /// row mix, rather than guessing from the aggregate `defilter_row`
+    /// number alone.
+    fn build_with_filter(
+        side: u32,
+        color_type: ColorType,
+        png_color_type: PngColorType,
+        filter: Option<PngFilter>,
+    ) -> Self {
+        let file = SquareFixture::new(side, png_color_type).encode_with_filter(filter);
         let ihdr = Ihdr {
             width: side,
             height: side,
@@ -123,6 +141,93 @@ fn defilter_truecolor(bencher: Bencher, side: u32) {
 #[divan::bench(args = BENCH_SIDES)]
 fn defilter_truecolor_alpha(bencher: Bencher, side: u32) {
     let stream = FilteredStream::build(side, ColorType::TruecolorAlpha, PngColorType::Rgba);
+    let row_len = 1 + stream.ihdr.stride();
+    bencher
+        .with_inputs(|| stream.inflated.clone())
+        .bench_local_values(|mut inflated| {
+            let mut defilter = Defilter::new(&stream.ihdr);
+            for row in inflated.chunks_mut(row_len) {
+                defilter.defilter_row(divan::black_box(row)).unwrap();
+            }
+            inflated
+        });
+}
+
+/// Isolates one `FilterType`'s reconstruction cost at a time on
+/// truecolor-alpha (`bpp == 4`) rows, pinned via `png`'s encoder rather
+/// than left to its adaptive per-row choice -- lets `Sub`/`Up` (SIMD
+/// fast-pathed in `simd.rs`) be compared directly against `Average`/
+/// `Paeth` (still pure scalar loops in `defilter.rs`) to find which of
+/// the two is the actual dominant cost within `defilter_row`'s realistic
+/// adaptive-filtered aggregate number above.
+#[divan::bench(args = BENCH_SIDES)]
+fn defilter_truecolor_alpha_sub_only(bencher: Bencher, side: u32) {
+    let stream = FilteredStream::build_with_filter(
+        side,
+        ColorType::TruecolorAlpha,
+        PngColorType::Rgba,
+        Some(PngFilter::Sub),
+    );
+    let row_len = 1 + stream.ihdr.stride();
+    bencher
+        .with_inputs(|| stream.inflated.clone())
+        .bench_local_values(|mut inflated| {
+            let mut defilter = Defilter::new(&stream.ihdr);
+            for row in inflated.chunks_mut(row_len) {
+                defilter.defilter_row(divan::black_box(row)).unwrap();
+            }
+            inflated
+        });
+}
+
+#[divan::bench(args = BENCH_SIDES)]
+fn defilter_truecolor_alpha_up_only(bencher: Bencher, side: u32) {
+    let stream = FilteredStream::build_with_filter(
+        side,
+        ColorType::TruecolorAlpha,
+        PngColorType::Rgba,
+        Some(PngFilter::Up),
+    );
+    let row_len = 1 + stream.ihdr.stride();
+    bencher
+        .with_inputs(|| stream.inflated.clone())
+        .bench_local_values(|mut inflated| {
+            let mut defilter = Defilter::new(&stream.ihdr);
+            for row in inflated.chunks_mut(row_len) {
+                defilter.defilter_row(divan::black_box(row)).unwrap();
+            }
+            inflated
+        });
+}
+
+#[divan::bench(args = BENCH_SIDES)]
+fn defilter_truecolor_alpha_average_only(bencher: Bencher, side: u32) {
+    let stream = FilteredStream::build_with_filter(
+        side,
+        ColorType::TruecolorAlpha,
+        PngColorType::Rgba,
+        Some(PngFilter::Avg),
+    );
+    let row_len = 1 + stream.ihdr.stride();
+    bencher
+        .with_inputs(|| stream.inflated.clone())
+        .bench_local_values(|mut inflated| {
+            let mut defilter = Defilter::new(&stream.ihdr);
+            for row in inflated.chunks_mut(row_len) {
+                defilter.defilter_row(divan::black_box(row)).unwrap();
+            }
+            inflated
+        });
+}
+
+#[divan::bench(args = BENCH_SIDES)]
+fn defilter_truecolor_alpha_paeth_only(bencher: Bencher, side: u32) {
+    let stream = FilteredStream::build_with_filter(
+        side,
+        ColorType::TruecolorAlpha,
+        PngColorType::Rgba,
+        Some(PngFilter::Paeth),
+    );
     let row_len = 1 + stream.ihdr.stride();
     bencher
         .with_inputs(|| stream.inflated.clone())

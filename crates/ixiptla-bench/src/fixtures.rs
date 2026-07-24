@@ -11,7 +11,7 @@
 //! than uniform or all-zero data), so every fixture here is built from
 //! the same xorshift32 byte stream.
 
-use png::{BitDepth, ColorType, Encoder};
+use png::{BitDepth, ColorType, Encoder, Filter};
 
 /// A small deterministic (not truly random, just varied-looking) pixel
 /// generator — xorshift32, cheap and reproducible across runs so
@@ -78,6 +78,25 @@ impl SquareFixture {
     /// builds.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_with_filter(None)
+    }
+
+    /// Like [`Self::encode`], but pins every row to a single `filter`
+    /// (bypassing `png`'s own default `Filter::Adaptive` per-row choice)
+    /// when `Some`, or keeps the adaptive default when `None`. Used to
+    /// isolate one `FilterType`'s reconstruction cost at a time (e.g. to
+    /// tell whether `Defilter::undo_paeth` or `undo_average` -- the two
+    /// filter types without a SIMD fast path -- actually dominate a real
+    /// adaptive-filtered file's mix, rather than guessing from the
+    /// aggregate).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `png` crate's encoder itself fails -- never expected
+    /// for the well-formed, in-range parameters this struct always
+    /// builds.
+    #[must_use]
+    pub fn encode_with_filter(&self, filter: Option<Filter>) -> Vec<u8> {
         let channels = self.channels();
         let mut src = PixelSource::new(0x9E37_79B9 ^ (self.side << 8) ^ channels);
         let raw: Vec<u8> = (0..(self.side as usize * self.side as usize * channels as usize))
@@ -88,6 +107,9 @@ impl SquareFixture {
         let mut encoder = Encoder::new(&mut out, self.side, self.side);
         encoder.set_color(self.color_type);
         encoder.set_depth(BitDepth::Eight);
+        if let Some(filter) = filter {
+            encoder.set_filter(filter);
+        }
         let mut writer = encoder.write_header().unwrap();
         writer.write_image_data(&raw).unwrap();
         writer.finish().unwrap();

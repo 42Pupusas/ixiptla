@@ -115,10 +115,10 @@ impl FilterScoreSimd {
         bpp: usize,
         start: usize,
     ) -> (FilterScores, usize) {
+        use crate::predictor_simd::PredictorSimd;
         use std::arch::x86_64::{
-            __m128i, _mm_add_epi64, _mm_and_si128, _mm_avg_epu8, _mm_loadu_si128, _mm_packus_epi16,
-            _mm_set1_epi8, _mm_setzero_si128, _mm_storeu_si128, _mm_sub_epi8, _mm_unpackhi_epi8,
-            _mm_unpacklo_epi8, _mm_xor_si128,
+            __m128i, _mm_add_epi64, _mm_loadu_si128, _mm_setzero_si128, _mm_storeu_si128,
+            _mm_sub_epi8,
         };
 
         let len = row.len();
@@ -135,7 +135,6 @@ impl FilterScoreSimd {
         // `index - bpp` reads are in bounds for both equal-length slices.
         unsafe {
             let zero = _mm_setzero_si128();
-            let low_bit = _mm_set1_epi8(1);
 
             let mut acc_none = zero;
             let mut acc_sub = zero;
@@ -156,28 +155,13 @@ impl FilterScoreSimd {
                 acc_sub = _mm_add_epi64(acc_sub, Self::magnitude_sum(_mm_sub_epi8(x, a), zero));
                 acc_up = _mm_add_epi64(acc_up, Self::magnitude_sum(_mm_sub_epi8(x, b), zero));
 
-                // Average: round-up mean minus the disagreeing low bit.
-                let mean = _mm_sub_epi8(
-                    _mm_avg_epu8(a, b),
-                    _mm_and_si128(_mm_xor_si128(a, b), low_bit),
-                );
+                // Average/Paeth predictors: shared with the filter
+                // *application* kernel in `filter_row_simd`, so both
+                // consumers can never disagree on the predictor itself.
+                let mean = PredictorSimd::average(a, b);
                 acc_avg = _mm_add_epi64(acc_avg, Self::magnitude_sum(_mm_sub_epi8(x, mean), zero));
 
-                // Paeth needs 16-bit lanes, so split into halves and
-                // repack. `packus` saturates, but every result is one of
-                // a/b/c and so already in 0..=255.
-                let predictor = _mm_packus_epi16(
-                    Self::paeth_half(
-                        _mm_unpacklo_epi8(a, zero),
-                        _mm_unpacklo_epi8(b, zero),
-                        _mm_unpacklo_epi8(c, zero),
-                    ),
-                    Self::paeth_half(
-                        _mm_unpackhi_epi8(a, zero),
-                        _mm_unpackhi_epi8(b, zero),
-                        _mm_unpackhi_epi8(c, zero),
-                    ),
-                );
+                let predictor = PredictorSimd::paeth(a, b, c);
                 acc_paeth = _mm_add_epi64(
                     acc_paeth,
                     Self::magnitude_sum(_mm_sub_epi8(x, predictor), zero),
@@ -215,59 +199,6 @@ impl FilterScoreSimd {
         // SAFETY: pure register operations, no memory access; the caller
         // is already inside the SSE2-guaranteed block.
         unsafe { _mm_sad_epu8(_mm_min_epu8(v, _mm_sub_epi8(zero, v)), zero) }
-    }
-
-    /// The Paeth predictor (spec §9.4) for eight 16-bit lanes.
-    ///
-    /// Selection is branchless: build an all-ones mask per condition and
-    /// blend, which is why the scalar `if/else if/else` chain becomes three
-    /// masks that partition the lanes exactly the way the spec's priority
-    /// order does (a, then b, then c).
-    #[cfg(target_arch = "x86_64")]
-    #[inline]
-    unsafe fn paeth_half(
-        a: std::arch::x86_64::__m128i,
-        b: std::arch::x86_64::__m128i,
-        c: std::arch::x86_64::__m128i,
-    ) -> std::arch::x86_64::__m128i {
-        use std::arch::x86_64::{
-            __m128i, _mm_add_epi16, _mm_and_si128, _mm_andnot_si128, _mm_cmpeq_epi16,
-            _mm_cmpgt_epi16, _mm_max_epi16, _mm_or_si128, _mm_setzero_si128, _mm_sub_epi16,
-        };
-        // SAFETY: pure register operations, no memory access; the caller
-        // is already inside the SSE2-guaranteed block.
-        unsafe {
-            let zero = _mm_setzero_si128();
-            let abs = |v: __m128i| _mm_max_epi16(v, _mm_sub_epi16(zero, v));
-
-            // With p = a + b - c, the spec's distances simplify: no `p`
-            // is ever formed, so everything stays inside 16 bits.
-            let da = _mm_sub_epi16(a, c);
-            let db = _mm_sub_epi16(b, c);
-            let pa = abs(db); // |p - a| = |b - c|
-            let pb = abs(da); // |p - b| = |a - c|
-            let pc = abs(_mm_add_epi16(da, db)); // |p - c|
-
-            // Inputs are bytes, so distances are far below i16::MAX and
-            // signed compares are safe. `x <= y` is `!(x > y)`.
-            let ones = _mm_cmpeq_epi16(zero, zero);
-            let a_loses_to_b = _mm_cmpgt_epi16(pa, pb);
-            let a_loses_to_c = _mm_cmpgt_epi16(pa, pc);
-            let b_loses_to_c = _mm_cmpgt_epi16(pb, pc);
-
-            // a wins when pa <= pb && pa <= pc; otherwise b wins when
-            // pb <= pc; otherwise c. The masks are disjoint by
-            // construction, so a plain OR blends them.
-            let choose_a = _mm_andnot_si128(_mm_or_si128(a_loses_to_b, a_loses_to_c), ones);
-            let not_a = _mm_andnot_si128(choose_a, ones);
-            let choose_b = _mm_andnot_si128(b_loses_to_c, not_a);
-            let choose_c = _mm_and_si128(b_loses_to_c, not_a);
-
-            _mm_or_si128(
-                _mm_and_si128(a, choose_a),
-                _mm_or_si128(_mm_and_si128(b, choose_b), _mm_and_si128(c, choose_c)),
-            )
-        }
     }
 }
 

@@ -65,18 +65,31 @@ impl Filter {
 
         match filter {
             FilterType::None => out.extend_from_slice(row),
+            // Sub/Up/Average/Paeth all delegate their whole-vector-chunk
+            // portion to `FilterRowSimd`, then finish whatever ragged tail
+            // is left with the same scalar formula the SIMD kernel itself
+            // is checked against. Unlike defiltering, application here has
+            // no serial dependency at all -- `a`/`b`/`c` are always
+            // original, already-known bytes, never a byte this same call
+            // just reconstructed -- so it vectorizes as cleanly as
+            // `FilterScorer`'s scoring pass already does (see
+            // `filter_row_simd`'s module doc for the full argument).
             FilterType::Sub => {
                 // The first `bpp` bytes have no left neighbour, so `a` is
                 // zero there and they pass through unchanged.
                 let split = self.bpp.min(row.len());
                 out.extend_from_slice(&row[..split]);
-                for index in split..row.len() {
+                let vectored_end =
+                    crate::filter_row_simd::FilterRowSimd::sub_chunks(row, self.bpp, split, out);
+                for index in vectored_end..row.len() {
                     out.push(row[index].wrapping_sub(row[index - self.bpp]));
                 }
             }
             FilterType::Up => {
-                for (&x, &b) in row.iter().zip(previous_row) {
-                    out.push(x.wrapping_sub(b));
+                let vectored_end =
+                    crate::filter_row_simd::FilterRowSimd::up_chunks(row, previous_row, 0, out);
+                for index in vectored_end..row.len() {
+                    out.push(row[index].wrapping_sub(previous_row[index]));
                 }
             }
             FilterType::Average => {
@@ -86,7 +99,14 @@ impl Filter {
                     // floor(b / 2).
                     out.push(row[index].wrapping_sub(previous_row[index] / 2));
                 }
-                for index in split..row.len() {
+                let vectored_end = crate::filter_row_simd::FilterRowSimd::average_chunks(
+                    row,
+                    previous_row,
+                    self.bpp,
+                    split,
+                    out,
+                );
+                for index in vectored_end..row.len() {
                     let a = row[index - self.bpp];
                     let b = previous_row[index];
                     out.push(row[index].wrapping_sub(u8::midpoint(a, b)));
@@ -99,7 +119,14 @@ impl Filter {
                     // selects `b`.
                     out.push(row[index].wrapping_sub(previous_row[index]));
                 }
-                for index in split..row.len() {
+                let vectored_end = crate::filter_row_simd::FilterRowSimd::paeth_chunks(
+                    row,
+                    previous_row,
+                    self.bpp,
+                    split,
+                    out,
+                );
+                for index in vectored_end..row.len() {
                     let a = row[index - self.bpp];
                     let b = previous_row[index];
                     let c = previous_row[index - self.bpp];

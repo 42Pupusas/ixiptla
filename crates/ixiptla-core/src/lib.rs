@@ -22,6 +22,7 @@ mod decoder;
 mod defilter;
 mod encoder;
 mod filter;
+mod filter_row_simd;
 mod filter_score_simd;
 mod filter_scorer;
 mod filter_type;
@@ -29,6 +30,8 @@ mod idat;
 mod ihdr;
 mod palette;
 mod pixel_bits;
+#[cfg(target_arch = "x86_64")]
+mod predictor_simd;
 mod rgba;
 mod signature;
 mod simd;

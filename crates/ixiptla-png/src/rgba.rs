@@ -184,7 +184,7 @@ impl<'a> RgbaExpander<'a> {
         });
 
         let mut out = vec![0u8; samples.len() * 4];
-        for (chunk, &v) in out.chunks_exact_mut(4).zip(samples) {
+        for (chunk, &v) in out.as_chunks_mut::<4>().0.iter_mut().zip(samples) {
             let a = if transparent_value == Some(u16::from(v)) {
                 0
             } else {

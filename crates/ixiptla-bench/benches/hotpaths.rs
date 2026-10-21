@@ -1,8 +1,8 @@
-//! Internal-hotpath benchmarks for `ixiptla-core`'s own pipeline stages,
+//! Internal-hotpath benchmarks for `ixiptla-png`'s own pipeline stages,
 //! via `divan`. Run with `cargo bench -p ixiptla-bench --bench hotpaths`.
 //!
 //! Unlike `end_to_end.rs` (which times whole-file decode against other
-//! crates), this file isolates each stage `ixiptla_core::Png::decode`
+//! crates), this file isolates each stage `ixiptla_png::Png::decode`
 //! chains together — defiltering, `Adam7` reassembly, and RGBA
 //! expansion — so a regression in one stage doesn't hide inside an
 //! aggregate "decode got slower" number. Each stage is fed pre-decoded
@@ -18,7 +18,7 @@
 
 use divan::Bencher;
 use ixiptla_bench::fixtures::{BENCH_SIDES, SquareFixture};
-use ixiptla_core::{ColorType, Crc32, Defilter, Ihdr, InterlaceMethod, Png, RgbaExpander};
+use ixiptla_png::{ColorType, Crc32, Defilter, Ihdr, InterlaceMethod, Png, RgbaExpander};
 use png::ColorType as PngColorType;
 use png::Filter as PngFilter;
 
@@ -70,7 +70,7 @@ struct FilteredStream {
 
 impl FilteredStream {
     /// Defilter every row of `inflated` in place, mirroring
-    /// `ixiptla_core::Png::defilter_sequential`'s own zero-copy "previous
+    /// `ixiptla_png::Png::defilter_sequential`'s own zero-copy "previous
     /// row" borrow (split at the read cursor, all-zero buffer for row 0)
     /// -- `Defilter::defilter_row` no longer tracks `previous_row`
     /// internally, so every caller (this benchmark included) is
@@ -92,7 +92,9 @@ impl FilteredStream {
                 &front[write_offset - stride..write_offset]
             };
             let row = &mut back[..row_len];
-            defilter.defilter_row(divan::black_box(row), previous_row).unwrap();
+            defilter
+                .defilter_row(divan::black_box(row), previous_row)
+                .unwrap();
             write_offset += stride;
         }
     }
@@ -146,7 +148,9 @@ impl FilteredStream {
         // decode cycles there, nowhere near what the old benchmark here
         // implied).
         let idat = extract_idat(&file);
-        let inflated = ixchel::zlib::decompress(&idat, 1 << 24).expect("fixture zlib decodes");
+        let inflated = ixchel::ZlibDecoder::new(1 << 24)
+            .decompress(&idat)
+            .expect("fixture zlib decodes");
         Self { ihdr, inflated }
     }
 }

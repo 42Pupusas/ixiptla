@@ -1,4 +1,4 @@
-//! End-to-end whole-file *encode* benchmarks: `ixiptla_core::Encoder`
+//! End-to-end whole-file *encode* benchmarks: `ixiptla_png::Encoder`
 //! versus the `png` crate's encoder, given identical raw pixel buffers.
 //! Run with `cargo bench -p ixiptla-bench --bench encode`.
 //!
@@ -17,7 +17,7 @@
 
 use divan::Bencher;
 use ixiptla_bench::raw_image::{Content, RawImage};
-use ixiptla_core::{ColorType, Encoder, FilterStrategy, FilterType};
+use ixiptla_png::{ColorType, Encoder, FilterStrategy, FilterType};
 use png::{BitDepth, Encoder as PngEncoder, Filter as PngFilter};
 
 #[global_allocator]
@@ -132,7 +132,10 @@ fn size_report() {
                 let image = RawImage::square(side, color_type, Content::Photographic);
                 let raw = image.pixels.len();
 
-                let adaptive = Encoder::new(image.ihdr).encode(&image.pixels).unwrap().len();
+                let adaptive = Encoder::new(image.ihdr)
+                    .encode(&image.pixels)
+                    .unwrap()
+                    .len();
                 let fixed_up = Encoder::new(image.ihdr)
                     .with_filter_strategy(FilterStrategy::Fixed(FilterType::Up))
                     .encode(&image.pixels)

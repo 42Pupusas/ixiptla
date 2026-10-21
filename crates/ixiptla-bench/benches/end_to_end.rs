@@ -1,4 +1,4 @@
-//! End-to-end whole-file decode benchmarks: `ixiptla_core::Png::decode` +
+//! End-to-end whole-file decode benchmarks: `ixiptla_png::Png::decode` +
 //! `RgbaExpander::expand` versus the `png` crate's own decoder and
 //! `image`'s `PngDecoder` (which itself wraps the `png` crate, but goes
 //! through `image`'s own buffer-management/`ImageDecoder` trait
@@ -20,7 +20,7 @@
 use divan::Bencher;
 use image::ImageDecoder as _;
 use ixiptla_bench::fixtures::{BENCH_SIDES, SquareFixture};
-use ixiptla_core::{Png, RgbaExpander};
+use ixiptla_png::{Png, RgbaExpander};
 use png::{ColorType as PngColorType, Transformations};
 use std::io::Cursor;
 
@@ -36,7 +36,7 @@ fn main() {
     divan::main();
 }
 
-/// `ixiptla_core::Png::decode` + `RgbaExpander::expand` on a truecolor-
+/// `ixiptla_png::Png::decode` + `RgbaExpander::expand` on a truecolor-
 /// alpha file -- the same normalized-to-RGBA8 output shape the other two
 /// decoders below produce, so all three are doing equivalent work.
 #[divan::bench(args = BENCH_SIDES)]

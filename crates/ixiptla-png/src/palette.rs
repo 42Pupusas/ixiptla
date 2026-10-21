@@ -23,7 +23,7 @@ impl Palette {
         if !data.len().is_multiple_of(3) {
             return Err(PaletteError::InvalidLength(data.len()));
         }
-        let entries: Vec<[u8; 3]> = data.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+        let entries: Vec<[u8; 3]> = data.as_chunks::<3>().0.to_vec();
         if entries.len() > 256 {
             return Err(PaletteError::TooManyEntries(entries.len()));
         }

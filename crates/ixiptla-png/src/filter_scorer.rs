@@ -139,7 +139,7 @@ impl FilterScorer {
     /// One byte position's contribution to all five candidates, with `a`
     /// and `c` supplied by the caller so the zero-neighbour prefix and the
     /// general case share one body.
-    fn score_at(
+    const fn score_at(
         &self,
         row: &[u8],
         previous_row: &[u8],
@@ -301,12 +301,12 @@ mod tests {
 
             let current = row(stride, 37, 11);
             let candidates = [
-                vec![0u8; stride],           // row 0: the restricted path
-                current.clone(),             // identical rows: Up wins
-                row(stride, 91, 5),          // unrelated content
-                row(stride, 37, 11 + 1),     // near-identical: small deltas
-                vec![255u8; stride],         // saturated row above
-                row(stride, 1, 0),           // gentle ramp
+                vec![0u8; stride],       // row 0: the restricted path
+                current.clone(),         // identical rows: Up wins
+                row(stride, 91, 5),      // unrelated content
+                row(stride, 37, 11 + 1), // near-identical: small deltas
+                vec![255u8; stride],     // saturated row above
+                row(stride, 1, 0),       // gentle ramp
             ];
             for previous in candidates {
                 assert_eq!(

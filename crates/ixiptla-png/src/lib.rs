@@ -1,4 +1,4 @@
-//! `ixiptla-core` — a zero-dependency PNG (ISO/IEC 15948) decoder core.
+//! `ixiptla-png` — a zero-dependency PNG (ISO/IEC 15948) codec.
 //!
 //! Named (with `ixchel`) to keep the weaving theme: if `ixchel` unweaves
 //! DEFLATE's compressed bitstream, `ixiptla` is the figure that stands in
@@ -6,7 +6,7 @@
 //! *ixiptla*, "representation/likeness" — the ritual stand-in for a thing).
 //!
 //! This crate owns chunk parsing, scanline defiltering, and orchestrating
-//! `ixchel::zlib` over the concatenated `IDAT` stream. It does not depend on
+//! `ixchel::ZlibDecoder` over the concatenated `IDAT` stream. It does not depend on
 //! any external PNG/compression crate.
 
 mod adam7;
@@ -28,6 +28,7 @@ mod filter_scorer;
 mod filter_type;
 mod idat;
 mod ihdr;
+mod image_conversion;
 mod palette;
 mod pixel_bits;
 #[cfg(target_arch = "x86_64")]

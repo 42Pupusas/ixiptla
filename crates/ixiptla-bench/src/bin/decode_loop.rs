@@ -11,7 +11,7 @@
 //! the code under test. This binary instead does one big, uninterrupted
 //! loop of real decode work with no harness in the hot path at all --
 //! `perf record`'s sampling profiler then attributes (essentially) every
-//! sample to `ixiptla_core` itself, giving a much cleaner call graph /
+//! sample to `ixiptla_png` itself, giving a much cleaner call graph /
 //! flat profile to read.
 //!
 //! Usage: `decode_loop [side] [iterations] [color_type]` (all optional;
@@ -24,7 +24,7 @@
 //! very different profiles.
 
 use ixiptla_bench::fixtures::SquareFixture;
-use ixiptla_core::{Png, RgbaExpander};
+use ixiptla_png::{Png, RgbaExpander};
 use png::ColorType as PngColorType;
 use std::hint::black_box;
 use std::time::Instant;
@@ -96,7 +96,7 @@ impl RunConfig {
     }
 }
 
-/// One profiling workload: repeatedly runs `ixiptla_core`'s full
+/// One profiling workload: repeatedly runs `ixiptla_png`'s full
 /// decode-to-RGBA8 pipeline (`Png::decode` + `RgbaExpander::expand`)
 /// over the same in-memory file bytes, so `perf` sees nothing but real
 /// pipeline work for the whole run.
@@ -104,7 +104,6 @@ struct DecodeLoop {
     file: Vec<u8>,
     iterations: u32,
 }
-
 
 impl DecodeLoop {
     /// Builds the requested fixture once and pairs it with the iteration

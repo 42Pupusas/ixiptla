@@ -113,7 +113,7 @@ impl Encoder {
         }
 
         let filtered = self.filtered_stream(pixels);
-        let compressed = ixchel::zlib::compress(&filtered);
+        let compressed = ixchel::ZlibEncoder::new().compress(&filtered);
 
         // Signature + IHDR + optional PLTE/tRNS + IDAT + IEND. Sizing this
         // up front keeps encoding to a single output allocation.

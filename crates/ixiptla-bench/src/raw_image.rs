@@ -17,7 +17,7 @@
 //! they use: [`Content::Photographic`] for anything comparing output size,
 //! [`Content::Noise`] to keep the compressor honest about its worst case.
 
-use ixiptla_core::{ColorType, Ihdr, InterlaceMethod};
+use ixiptla_png::{ColorType, Ihdr, InterlaceMethod};
 
 /// The pixel content a benchmark image is filled with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

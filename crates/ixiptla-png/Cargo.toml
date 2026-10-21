@@ -1,6 +1,6 @@
 [package]
-name = "ixiptla-core"
-description = "Zero-dep PNG decoder core: chunk parsing, scanline defiltering, and IDAT decompression via ixchel"
+name = "ixiptla-png"
+description = "Zero-dep PNG codec: chunk parsing, scanline (de)filtering, and IDAT (de)compression via ixchel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -25,4 +25,5 @@ parallel = ["dep:quetzalcoatl"]
 
 [dependencies]
 ixchel.workspace = true
+ixiptla-pixel.workspace = true
 quetzalcoatl = { workspace = true, optional = true }

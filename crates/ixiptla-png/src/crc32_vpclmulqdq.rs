@@ -32,10 +32,10 @@
 //! convergence, Barrett reduction, sub-16-byte remainder) are unchanged,
 //! reusing [`crate::crc32_pclmulqdq::Pclmulqdq::converge`] directly.
 
-use crate::crc32_pclmulqdq::{Pclmulqdq, K1, K2};
+use crate::crc32_pclmulqdq::{K1, K2, Pclmulqdq};
 use std::arch::x86_64::{
-    __m256i, _mm256_clmulepi64_epi128, _mm256_inserti128_si256, _mm256_loadu_si256,
-    _mm256_set_epi64x, _mm256_xor_si256, _mm_cvtsi32_si128, _mm_xor_si128,
+    __m256i, _mm_cvtsi32_si128, _mm_xor_si128, _mm256_clmulepi64_epi128, _mm256_inserti128_si256,
+    _mm256_loadu_si256, _mm256_set_epi64x, _mm256_xor_si256,
 };
 
 /// Same threshold rationale as [`crate::crc32_pclmulqdq::Pclmulqdq::
@@ -225,8 +225,7 @@ mod tests {
         }
 
         for len in [
-            0, 1, 15, 16, 63, 64, 65, 127, 128, 129, 191, 192, 193, 255, 256, 257, 1000, 4096,
-            4111,
+            0, 1, 15, 16, 63, 64, 65, 127, 128, 129, 191, 192, 193, 255, 256, 257, 1000, 4096, 4111,
         ] {
             for seed in [0x1234_5678u32, 0x9E37_79B9, 0, 0xFFFF_FFFF] {
                 let bytes = gen_bytes(seed, len);

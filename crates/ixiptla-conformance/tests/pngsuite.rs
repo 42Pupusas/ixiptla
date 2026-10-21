@@ -1,4 +1,4 @@
-//! Diff-tests `ixiptla_core` against the `png` crate over the real-world
+//! Diff-tests `ixiptla_png` against the `png` crate over the real-world
 //! `PngSuite` corpus (Willem van Schaik's "the official set of PNG test
 //! images", vendored under `tests/pngsuite/` from `image-rs/image-png`'s
 //! own copy — see `tests/pngsuite/PngSuite.README` /
@@ -44,7 +44,7 @@ impl PngSuiteCorpus {
 
     /// Walk every `*.png` fixture, diff-testing valid ones against the
     /// `png` crate and asserting deliberately-invalid ones are rejected
-    /// by `ixiptla_core` too. Panics with every failing filename at once
+    /// by `ixiptla_png` too. Panics with every failing filename at once
     /// (rather than stopping at the first) so a single run reports the
     /// full extent of any regression.
     fn run(&self) {
@@ -66,9 +66,9 @@ impl PngSuiteCorpus {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
 
             if Self::expects_rejection(path) {
-                if ixiptla_core::Png::decode(&file, 1 << 24).is_ok() {
+                if ixiptla_png::Png::decode(&file, 1 << 24).is_ok() {
                     failures.push(format!(
-                        "{name}: expected ixiptla_core to reject this (PngSuite 'x' = deliberately invalid), but it decoded successfully"
+                        "{name}: expected ixiptla_png to reject this (PngSuite 'x' = deliberately invalid), but it decoded successfully"
                     ));
                 }
                 continue;

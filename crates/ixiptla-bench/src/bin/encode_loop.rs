@@ -18,7 +18,7 @@
 //! costs once filter selection is removed).
 
 use ixiptla_bench::raw_image::{Content, RawImage};
-use ixiptla_core::{ColorType, Encoder, FilterStrategy, FilterType};
+use ixiptla_png::{ColorType, Encoder, FilterStrategy, FilterType};
 use std::hint::black_box;
 use std::time::Instant;
 

@@ -1,4 +1,4 @@
-//! Validates `ixiptla_core::Encoder`'s output against an independent
+//! Validates `ixiptla_png::Encoder`'s output against an independent
 //! decoder.
 //!
 //! # Why round-tripping through our own decoder isn't enough
@@ -13,11 +13,11 @@
 //! from the spec independently, so agreement is real evidence the bytes on
 //! disk are conformant rather than merely self-consistent.
 
-use ixiptla_core::{ColorType, Encoder, FilterStrategy, Ihdr, InterlaceMethod};
+use ixiptla_png::{ColorType, Encoder, FilterStrategy, Ihdr, InterlaceMethod};
 
 use crate::ReferenceComparison;
 
-/// Encodes synthetic images with `ixiptla_core` and checks the `png` crate
+/// Encodes synthetic images with `ixiptla_png` and checks the `png` crate
 /// decodes them to the pixels we started from.
 #[derive(Debug)]
 pub struct EncoderConformance {
@@ -77,7 +77,7 @@ impl EncoderConformance {
     }
 
     /// Encode this geometry with `strategy` and confirm the `png` crate
-    /// and `ixiptla_core` both decode the result to identical RGBA8.
+    /// and `ixiptla_png` both decode the result to identical RGBA8.
     ///
     /// # Errors
     ///

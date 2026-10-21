@@ -1,6 +1,6 @@
 [package]
 name = "ixiptla-bench"
-description = "Divan benchmarks for ixiptla-core: internal hotpath coverage plus end-to-end comparisons against the `png` and `image` crates."
+description = "Divan benchmarks for ixiptla-png: internal hotpath coverage plus end-to-end comparisons against the `png` and `image` crates."
 publish = false
 version.workspace = true
 edition.workspace = true
@@ -19,11 +19,11 @@ workspace = true
 # `ixiptla-conformance/src/reference_decoder.rs` is: both `benches/
 # hotpaths.rs` and `benches/end_to_end.rs` link this crate's compiled lib
 # code, not its `#[cfg(test)]` code.
-ixiptla-core.workspace = true
+ixiptla-png.workspace = true
 # hotpaths.rs's `FilteredStream::build` needs to zlib-inflate a fixture's
 # concatenated IDAT payload itself (to recover genuinely-filtered scanline
 # bytes for benchmarking `Defilter` in isolation, without `Png::decode`
-# defiltering them first) -- the same `ixchel` `ixiptla-core` itself uses.
+# defiltering them first) -- the same `ixchel` `ixiptla-png` itself uses.
 ixchel.workspace = true
 png = "0.18"
 # Only needed to hand-assemble the Adam7-interlaced fixture (`png` 0.18's
@@ -36,7 +36,7 @@ crc32fast = "1"
 divan = "0.1"
 # The other real-world decoder end_to_end.rs diffs wall-clock decode time
 # against -- pulled in only for these comparison benchmarks, never by
-# ixiptla-core itself.
+# ixiptla-png itself.
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [[bench]]

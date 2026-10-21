@@ -1,0 +1,14 @@
+[package]
+name = "ixiptla-pixel"
+description = "Format-neutral decoded image buffers shared by the ixiptla PNG, JPEG and JPEG XL codecs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

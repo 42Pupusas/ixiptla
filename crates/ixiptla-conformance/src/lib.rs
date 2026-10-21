@@ -1,20 +1,20 @@
 //! `ixiptla-conformance` — differential ("diff") testing of
-//! `ixiptla-core` against the battle-tested [`png`] crate (`image-rs`'s
+//! `ixiptla-png` against the battle-tested [`png`] crate (`image-rs`'s
 //! `image-png`, used by GNOME/Chromium and fuzzed on OSS-Fuzz).
 //!
-//! `ixiptla-core`'s own tests prove its decoder agrees with *itself* — the
+//! `ixiptla-png`'s own tests prove its decoder agrees with *itself* — the
 //! same hand-rolled understanding of the PNG spec used to build test
 //! fixtures is used to check them. That can't catch a shared
 //! misunderstanding of the spec. This crate instead builds PNG files with
-//! `png`'s encoder and asserts `ixiptla_core::Png::decode` +
+//! `png`'s encoder and asserts `ixiptla_png::Png::decode` +
 //! `RgbaExpander::expand` produces byte-identical RGBA8 output to `png`'s
 //! own decoder (with `Transformations::EXPAND | ALPHA | STRIP_16`, so both
 //! sides normalize to one comparable representation) for the same file.
 //!
 //! Kept as its own crate (`dev-dependencies` only, `publish = false`)
-//! rather than a `[dev-dependencies]` entry inside `ixiptla-core` itself,
+//! rather than a `[dev-dependencies]` entry inside `ixiptla-png` itself,
 //! so pulling in a whole other PNG implementation for testing purposes
-//! never taints `ixiptla-core`'s own zero-dependency build.
+//! never taints `ixiptla-png`'s own zero-dependency build.
 //!
 //! `png` 0.18's own `Writer::write_image_data` does not implement Adam7
 //! interlaced *encoding* (only decoding) — giving it `Info::interlaced =
@@ -22,7 +22,7 @@
 //! it outright. So Adam7 fixtures here are hand-assembled: raw chunks
 //! written directly (signature/IHDR/PLTE/IDAT/IEND, CRC via `crc32fast`,
 //! `IDAT` payload zlib-compressed via `flate2`), decoded solely by both
-//! `ixiptla_core::Png::decode` and the `png` crate's *decoder* (which does
+//! `ixiptla_png::Png::decode` and the `png` crate's *decoder* (which does
 //! support Adam7) for comparison — the goal is diffing decode behavior,
 //! not exercising `png`'s encoder for this one case.
 //!
@@ -34,7 +34,7 @@
 //! corpus alongside the synthetic fixtures built below.
 
 //! The reverse direction is covered too: [`encoder_conformance`] hands
-//! files produced by `ixiptla_core::Encoder` to the `png` crate's decoder,
+//! files produced by `ixiptla_png::Encoder` to the `png` crate's decoder,
 //! so our *output* is validated by an independent implementation rather
 //! than only by our own decoder (which could share a misreading with it).
 
@@ -47,7 +47,7 @@ pub use reference_decoder::ReferenceComparison;
 #[cfg(test)]
 mod encoder_tests {
     use crate::EncoderConformance;
-    use ixiptla_core::{ColorType, FilterStrategy, FilterType, InterlaceMethod};
+    use ixiptla_png::{ColorType, FilterStrategy, FilterType, InterlaceMethod};
 
     #[test]
     fn png_crate_accepts_every_color_type_and_bit_depth_we_encode() {
@@ -109,10 +109,22 @@ mod encoder_tests {
         // 1-pixel rows/columns, and sizes small enough that most Adam7
         // passes are empty.
         for (width, height) in [(1, 1), (1, 9), (9, 1), (2, 3), (3, 2), (5, 5)] {
-            EncoderConformance::new(width, height, ColorType::Truecolor, 8, InterlaceMethod::None)
-                .assert_matches(FilterStrategy::Adaptive);
-            EncoderConformance::new(width, height, ColorType::Truecolor, 8, InterlaceMethod::Adam7)
-                .assert_matches(FilterStrategy::Adaptive);
+            EncoderConformance::new(
+                width,
+                height,
+                ColorType::Truecolor,
+                8,
+                InterlaceMethod::None,
+            )
+            .assert_matches(FilterStrategy::Adaptive);
+            EncoderConformance::new(
+                width,
+                height,
+                ColorType::Truecolor,
+                8,
+                InterlaceMethod::Adam7,
+            )
+            .assert_matches(FilterStrategy::Adaptive);
         }
     }
 }
@@ -211,7 +223,7 @@ mod tests {
 
     /// Generate raw (unfiltered) Adam7-interlaced sample bytes for an
     /// image of `width` x `height`, `bytes_per_sample`-wide samples, in
-    /// the pass-major order both `ixiptla_core::Png::decode` and the
+    /// the pass-major order both `ixiptla_png::Png::decode` and the
     /// `png` crate's `Writer::write_image_data` (when `Info::interlaced`
     /// is set) expect: pass 1's rows top-to-bottom, then pass 2's, ...,
     /// pass 7's — each pass being its own tiny sub-sampled image (spec

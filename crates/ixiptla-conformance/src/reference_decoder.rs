@@ -7,20 +7,19 @@
 //! test binary couldn't reach it) so there is exactly one implementation
 //! of "decode with both crates and diff the RGBA8 bytes" to keep correct.
 
-use ixiptla_core::{Png, RgbaExpander};
+use ixiptla_png::{Png, RgbaExpander};
 use png::{ColorType as PngColorType, Transformations};
 use std::io::Cursor;
 
-/// Decodes a PNG file with both `ixiptla_core` and the `png` crate,
+/// Decodes a PNG file with both `ixiptla_png` and the `png` crate,
 /// normalizes both to RGBA8, and reports whether they agree.
 #[derive(Debug)]
 pub struct ReferenceComparison;
 
 impl ReferenceComparison {
-    /// Decode `file` with `ixiptla_core`, expanded to RGBA8.
+    /// Decode `file` with `ixiptla_png`, expanded to RGBA8.
     fn decode_with_ixiptla(file: &[u8]) -> Result<Vec<u8>, String> {
-        let decoded =
-            Png::decode(file, 1 << 24).map_err(|e| format!("ixiptla_core decode: {e}"))?;
+        let decoded = Png::decode(file, 1 << 24).map_err(|e| format!("ixiptla_png decode: {e}"))?;
         let expander = RgbaExpander::new(
             &decoded.ihdr,
             decoded.palette.as_ref(),
@@ -34,7 +33,7 @@ impl ReferenceComparison {
         // comment.
         expander
             .expand_owned(decoded.pixels)
-            .map_err(|e| format!("ixiptla_core expand: {e}"))
+            .map_err(|e| format!("ixiptla_png expand: {e}"))
     }
 
     /// Decode `file` with the `png` crate, normalized to RGBA8.
@@ -46,7 +45,7 @@ impl ReferenceComparison {
     /// grayscale/grayscale+alpha output is still 1 or 2 samples/pixel
     /// here; [`Self::normalize_to_rgba8`] below does that replication by
     /// hand so both sides land on the same 4-bytes/pixel layout
-    /// `ixiptla_core::RgbaExpander` produces.
+    /// `ixiptla_png::RgbaExpander` produces.
     fn decode_with_png_crate(file: &[u8]) -> Result<Vec<u8>, String> {
         let mut decoder = png::Decoder::new(Cursor::new(file));
         decoder.set_transformations(
@@ -70,8 +69,10 @@ impl ReferenceComparison {
         match color_type {
             PngColorType::Grayscale => buf.iter().flat_map(|&v| [v, v, v, 255]).collect(),
             PngColorType::GrayscaleAlpha => buf
-                .chunks_exact(2)
-                .flat_map(|px| [px[0], px[0], px[0], px[1]])
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|&[gray, alpha]| [gray, gray, gray, alpha])
                 .collect(),
             PngColorType::Rgba => buf.to_vec(),
             other => panic!("unexpected post-EXPAND|ALPHA color type: {other:?}"),
@@ -90,10 +91,10 @@ impl ReferenceComparison {
             (Ok(reference), Ok(ours)) if ours == reference => Ok(()),
             (Ok(_), Ok(_)) => Err("RGBA8 bytes diverge between decoders".to_string()),
             (Err(e), Ok(_)) => Err(format!(
-                "png crate rejected the file but ixiptla_core accepted it: {e}"
+                "png crate rejected the file but ixiptla_png accepted it: {e}"
             )),
             (Ok(_), Err(e)) => Err(format!(
-                "ixiptla_core rejected the file but the png crate accepted it: {e}"
+                "ixiptla_png rejected the file but the png crate accepted it: {e}"
             )),
             (Err(png_err), Err(ixiptla_err)) => {
                 // Both reject it -- that's agreement too, just log why in

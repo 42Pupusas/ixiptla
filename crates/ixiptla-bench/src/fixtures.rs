@@ -54,8 +54,8 @@ impl SquareFixture {
     }
 
     /// Samples per pixel for this fixture's colour type (mirrors
-    /// `ixiptla_core::ColorType::channel_count`, kept independent since
-    /// this crate intentionally doesn't depend on `ixiptla-core`'s
+    /// `ixiptla_png::ColorType::channel_count`, kept independent since
+    /// this crate intentionally doesn't depend on `ixiptla-png`'s
     /// internals to build fixtures — only the `png` crate's own enum).
     const fn channels(&self) -> u32 {
         match self.color_type {
@@ -146,9 +146,9 @@ fn write_raw_chunk(out: &mut Vec<u8>, kind: [u8; 4], data: &[u8]) {
 
 /// Adam7's 7 fixed sub-sampling patterns (spec §8.2, table 8.3):
 /// `(x_sampling, x_offset, y_sampling, y_offset)`, one per pass, in pass
-/// order -- duplicated from `ixiptla_core::Adam7Pass`'s private constant
+/// order -- duplicated from `ixiptla_png::Adam7Pass`'s private constant
 /// table on purpose: this crate builds fixture *bytes* independently of
-/// `ixiptla_core`'s own Adam7 implementation, so a bug in that
+/// `ixiptla_png`'s own Adam7 implementation, so a bug in that
 /// implementation can't also corrupt the benchmark input in a way that
 /// hides it.
 const ADAM7_PASS_CONSTANTS: [(u32, u32, u32, u32); 7] = [

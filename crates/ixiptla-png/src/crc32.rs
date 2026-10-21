@@ -115,8 +115,8 @@ impl Crc32 {
     /// implementation, instead of a second hand-ported copy of it.
     pub(crate) fn update_state_scalar(state: u32, bytes: &[u8]) -> u32 {
         let mut c = state;
-        let mut chunks = bytes.chunks_exact(8);
-        for chunk in &mut chunks {
+        let (blocks, remainder) = bytes.as_chunks::<8>();
+        for chunk in blocks {
             // Fold the running CRC's 4 bytes in as the first 4 input
             // bytes of this block (standard slicing-by-8 combine), then
             // look up each of the 8 block bytes in its own lane table and
@@ -137,7 +137,7 @@ impl Crc32 {
                 ^ Self::TABLES[1][chunk[6] as usize]
                 ^ Self::TABLES[0][chunk[7] as usize];
         }
-        for &byte in chunks.remainder() {
+        for &byte in remainder {
             c = Self::TABLES[0][((c ^ u32::from(byte)) & 0xFF) as usize] ^ (c >> 8);
         }
         c

@@ -38,11 +38,11 @@ pub struct Png {
 
 impl Png {
     /// Decode a complete PNG file's bytes: signature, chunk stream, `IHDR`,
-    /// concatenated `IDAT` payloads inflated via `ixchel::zlib`, and each
+    /// concatenated `IDAT` payloads inflated via `ixchel::ZlibDecoder`, and each
     /// resulting scanline defiltered.
     ///
     /// `max_decompressed` bounds the inflated `IDAT` size (a
-    /// decompression-bomb guard — forwarded to `ixchel::zlib::decompress`).
+    /// decompression-bomb guard — forwarded to `ixchel::ZlibDecoder::new`).
     ///
     /// # Errors
     ///
@@ -108,11 +108,9 @@ impl Png {
         // hint turns however many doubling reallocations a wrong guess
         // costs into exactly one.
         let inflated_size_hint = Self::expected_inflated_size(&ihdr);
-        let inflated = ixchel::zlib::decompress_with_hint(
-            idat.as_slice(),
-            max_decompressed,
-            Some(inflated_size_hint),
-        )?;
+        let inflated = ixchel::ZlibDecoder::new(max_decompressed)
+            .with_size_hint(inflated_size_hint)
+            .decompress(idat.as_slice())?;
 
         let pixels = match ihdr.interlace {
             InterlaceMethod::None => Self::defilter_sequential(&ihdr, inflated)?,
@@ -130,7 +128,7 @@ impl Png {
     /// The exact byte count `IDAT` inflates to for this `IHDR`, computed
     /// without looking at the compressed bytes at all -- see the call
     /// site's comment in [`Self::decode`] for why this is worth passing to
-    /// `ixchel::zlib::decompress_with_hint` instead of letting it guess.
+    /// `ixchel::ZlibDecoder::with_size_hint` instead of letting it guess.
     ///
     /// Non-interlaced: `height` scanlines, each `1 + stride` bytes (the
     /// leading filter-type byte plus the row's content).
@@ -463,7 +461,7 @@ mod tests {
         ihdr_data.push(0); // interlace: none
         file.extend(encode_chunk(*b"IHDR", &ihdr_data));
 
-        let zlib_data = ixchel::zlib::compress(raw_scanlines);
+        let zlib_data = ixchel::ZlibEncoder::new().compress(raw_scanlines);
         file.extend(encode_chunk(*b"IDAT", &zlib_data));
 
         file.extend(encode_chunk(*b"IEND", b""));
@@ -532,7 +530,7 @@ mod tests {
         ihdr_data.extend_from_slice(&3u32.to_be_bytes()); // claims height 3
         ihdr_data.extend_from_slice(&[8, 0, 0, 0, 0]);
         file.extend(encode_chunk(*b"IHDR", &ihdr_data));
-        let zlib_data = ixchel::zlib::compress(&raw); // only 2 actual rows
+        let zlib_data = ixchel::ZlibEncoder::new().compress(&raw); // only 2 actual rows
         file.extend(encode_chunk(*b"IDAT", &zlib_data));
         file.extend(encode_chunk(*b"IEND", b""));
 
@@ -549,7 +547,7 @@ mod tests {
     #[test]
     fn idat_split_across_multiple_chunks_is_concatenated() {
         let raw = [0u8, 10, 20, 0, 30, 40];
-        let zlib_data = ixchel::zlib::compress(&raw);
+        let zlib_data = ixchel::ZlibEncoder::new().compress(&raw);
         let mid = zlib_data.len() / 2;
 
         let mut file = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
@@ -592,7 +590,7 @@ mod tests {
         for pass in pass_raw_scanlines {
             idat_source.extend_from_slice(pass);
         }
-        let zlib_data = ixchel::zlib::compress(&idat_source);
+        let zlib_data = ixchel::ZlibEncoder::new().compress(&idat_source);
         file.extend(encode_chunk(*b"IDAT", &zlib_data));
         file.extend(encode_chunk(*b"IEND", b""));
         file
@@ -648,7 +646,7 @@ mod tests {
         file.extend(encode_chunk(*b"IHDR", &ihdr_data));
         file.extend(encode_chunk(*b"PLTE", &[10, 20, 30, 40, 50, 60]));
         let raw = [0u8, 1, 0]; // filter byte + indices 1, 0
-        let zlib_data = ixchel::zlib::compress(&raw);
+        let zlib_data = ixchel::ZlibEncoder::new().compress(&raw);
         file.extend(encode_chunk(*b"IDAT", &zlib_data));
         file.extend(encode_chunk(*b"IEND", b""));
 
@@ -668,7 +666,7 @@ mod tests {
         ihdr_data.extend_from_slice(&[8, 3, 0, 0, 0]);
         file.extend(encode_chunk(*b"IHDR", &ihdr_data));
         let raw = [0u8, 0];
-        let zlib_data = ixchel::zlib::compress(&raw);
+        let zlib_data = ixchel::ZlibEncoder::new().compress(&raw);
         file.extend(encode_chunk(*b"IDAT", &zlib_data));
         file.extend(encode_chunk(*b"IEND", b""));
 
@@ -694,7 +692,7 @@ mod tests {
         file.extend(encode_chunk(*b"IHDR", &ihdr_data));
         file.extend(encode_chunk(*b"tRNS", &[0x00, 0x2A])); // transparent sample 42
         let raw = [0u8, 42];
-        let zlib_data = ixchel::zlib::compress(&raw);
+        let zlib_data = ixchel::ZlibEncoder::new().compress(&raw);
         file.extend(encode_chunk(*b"IDAT", &zlib_data));
         file.extend(encode_chunk(*b"IEND", b""));
 
@@ -712,7 +710,7 @@ mod tests {
         file.extend(encode_chunk(*b"IHDR", &ihdr_data));
         file.extend(encode_chunk(*b"tRNS", &[0x00, 0x2A]));
         let raw = [0u8, 42, 255];
-        let zlib_data = ixchel::zlib::compress(&raw);
+        let zlib_data = ixchel::ZlibEncoder::new().compress(&raw);
         file.extend(encode_chunk(*b"IDAT", &zlib_data));
         file.extend(encode_chunk(*b"IEND", b""));
 

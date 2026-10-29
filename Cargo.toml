@@ -15,11 +15,10 @@ repository = "https://github.com/42Pupusas/ixiptla"
 rust-version = "1.89"
 
 [workspace.dependencies]
-ixchel = { path = "../ixchel" }
+ixchel = "0.1.0"
 ixiptla-png = { path = "crates/ixiptla-png", version = "0.1.0" }
 ixiptla-pixel = { path = "crates/ixiptla-pixel", version = "0.1.0" }
-mecatl = { path = "../mecatl", version = "0.1" }
-quetzalcoatl = { path = "../quetzalcoatl", version = "0.15" }
+quetzalcoatl = "0.15"
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"
